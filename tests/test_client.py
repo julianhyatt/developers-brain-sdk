@@ -11,15 +11,6 @@ from __future__ import annotations
 
 import httpx
 import pytest
-from tests.conftest import (
-    TOKEN,
-    json_response,
-    make_client,
-    make_hit,
-    make_project_payload,
-    make_search_payload,
-    make_submission_payload,
-)
 
 from dbrain.exceptions import (
     BrainAmbiguousError,
@@ -28,6 +19,15 @@ from dbrain.exceptions import (
     BrainNotFoundError,
     BrainRateLimitError,
     BrainValidationError,
+)
+from tests.conftest import (
+    TOKEN,
+    json_response,
+    make_client,
+    make_hit,
+    make_project_payload,
+    make_search_payload,
+    make_submission_payload,
 )
 
 
