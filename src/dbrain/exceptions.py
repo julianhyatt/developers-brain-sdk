@@ -46,13 +46,18 @@ class BrainValidationError(BrainHTTPError):
 
 
 class BrainAmbiguousError(BrainHTTPError):
-    """5xx nach einer nicht-idempotenten Anfrage (`store()`/`feedback()`).
-
-    Der Server hat möglicherweise committet, bevor er den Fehler
-    zurückgab — der Client kann das ohne Idempotency-Key nicht
+    """Der Ausgang einer nicht-idempotenten Anfrage (`store()`/`feedback()`)
+    ist unklar — der Server hat möglicherweise committet, bevor der Client
+    das erfuhr. Der Client kann das ohne Idempotency-Key nicht
     unterscheiden und wiederholt deshalb nicht automatisch. Vor einem
     manuellen erneuten Versuch prüfen, ob der Eintrag/das Feedback schon
     angekommen ist.
+
+    Zwei Ursachen, dieselbe Unsicherheit: ein 5xx **nach** einer Antwort
+    (`status_code` trägt den echten HTTP-Status) oder ein Verbindungsabbruch
+    (`ReadTimeout`/`WriteTimeout`/…), der den Request möglicherweise bereits
+    beim Server ankommen ließ, bevor die Verbindung riss — dafür ist
+    `status_code` `0`, weil es keine echte HTTP-Antwort gab.
     """
 
 

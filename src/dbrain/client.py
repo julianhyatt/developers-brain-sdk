@@ -7,11 +7,18 @@
 Verbindungsfehler, Timeout oder 5xx wird bedenkenlos wiederholt.
 
 `store()` und `feedback()` schreiben, und die Unterscheidung, die zählt,
-ist nicht *welcher* Fehler auftrat, sondern *wann*:
+ist nicht *welcher* Fehler auftrat, sondern *ob beweisbar ist*, dass der
+Request den Server nie erreicht hat:
 
-- Ein Verbindungsfehler oder Timeout, **bevor** irgendeine Antwort beim
-  Client ankam, heißt: der Request hat den Server nachweislich nie
-  verarbeitet. Retryable, für alle vier Methoden.
+- `ConnectError`/`ConnectTimeout`/`PoolTimeout` — die Verbindung kam nie
+  zustande, der Server hat vom Request nichts gesehen. Retryable, für
+  alle vier Methoden.
+- `ReadTimeout`/`WriteTimeout`/sonstige `TransportError` **nach**
+  aufgebauter Verbindung — der Request könnte bereits vollständig
+  gesendet und verarbeitet worden sein, das SDK kann es nicht
+  unterscheiden. Für `search()`/`list_projects()` unbedenklich (kein
+  Nebeneffekt); für `store()`/`feedback()` **nicht automatisch
+  retryable** — dieselbe Ambiguität wie unten, als `BrainAmbiguousError`.
 - Ein 5xx-Statuscode, also eine Antwort kam an, nur eine schlechte, heißt
   für `store()`/`feedback()`: unklar, ob committet wurde, bevor der
   Fehler zurückkam. **Nicht automatisch retryable** — das wird als
@@ -232,17 +239,50 @@ class BrainClient:
         immer, 5xx nur wenn `idempotent`. Gibt jede andere Antwort
         unverändert zurück; die Statuscode-Interpretation (401/403/404/422)
         bleibt bei den aufrufenden Methoden, weil `store()` einen 422
-        anders behandelt als alle anderen."""
+        anders behandelt als alle anderen.
+
+        **`ConnectTimeout`/`PoolTimeout` vs. `ReadTimeout`/`WriteTimeout` —
+        nicht dieselbe Garantie.** Nur die ersten beiden beweisen, dass der
+        Request den Server nie erreicht hat (die Verbindung kam gar nicht
+        zustande). Ein `ReadTimeout` heißt: der Request wurde vollständig
+        gesendet, der Server hat ihn möglicherweise verarbeitet — dieselbe
+        Unsicherheit wie ein 5xx *nach* einer Antwort. Für `idempotent=False`
+        gilt deshalb dieselbe Grenze wie bei einem 5xx: sicher retryable ist
+        nur, was beweisbar vor jeder Verarbeitung scheiterte.
+        """
         versuch = 0
         while True:
             versuch += 1
             try:
                 response = self._client.request(method, path, json=json)
-            except (httpx.TimeoutException, httpx.TransportError) as fehler:
+            except (
+                httpx.ConnectError,
+                httpx.ConnectTimeout,
+                httpx.PoolTimeout,
+            ) as fehler:
+                # Verbindung kam nie zustande — für jede Methode sicher
+                # retryable, der Server hat nichts davon gesehen.
                 if versuch > self._max_retries:
                     raise exc.BrainConnectionError(str(fehler)) from fehler
                 self._warten(versuch)
                 continue
+            except (httpx.TimeoutException, httpx.TransportError) as fehler:
+                # ReadTimeout/WriteTimeout/ReadError/… — der Request könnte
+                # den Server bereits erreicht (und bei store()/feedback()
+                # bereits etwas ausgelöst) haben. Für idempotente Aufrufe
+                # so unbedenklich wie oben; für nicht-idempotente dieselbe
+                # Ambiguität wie ein 5xx nach Antwort.
+                if idempotent:
+                    if versuch > self._max_retries:
+                        raise exc.BrainConnectionError(str(fehler)) from fehler
+                    self._warten(versuch)
+                    continue
+                raise exc.BrainAmbiguousError(
+                    0,
+                    "Status unklar — Verbindung brach ab, nachdem der "
+                    "Request möglicherweise bereits gesendet wurde; Server "
+                    f"hat ihn eventuell schon verarbeitet ({fehler})",
+                ) from fehler
 
             if response.status_code == 429:
                 if versuch > self._max_retries:

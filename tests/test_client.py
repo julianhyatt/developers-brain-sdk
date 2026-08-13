@@ -97,6 +97,70 @@ def test_store_retryt_verbindungsfehler_vor_antwort() -> None:
     assert versuche == 2
 
 
+def test_store_wiederholt_readtimeout_nach_gesendetem_request_nicht() -> None:
+    """Ein `ReadTimeout` beweist NICHT, dass der Server den Request nie
+    sah — anders als `ConnectError`. Für `store()` darf das deshalb nicht
+    automatisch retryt werden."""
+    versuche = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal versuche
+        versuche += 1
+        raise httpx.ReadTimeout("Server hat schon alles gelesen, Antwort kam nie an")
+
+    with make_client(handler) as client, pytest.raises(BrainAmbiguousError):
+        client.store(
+            project=str(__import__("uuid").uuid4()),
+            title="Titel",
+            content="Inhalt",
+            source="test",
+        )
+
+    assert versuche == 1  # kein einziger Retry
+
+
+def test_search_retryt_readtimeout() -> None:
+    """`search()` ist ohne Nebenwirkung — ein `ReadTimeout` darf hier
+    weiterhin bedenkenlos retryt werden, anders als bei `store()`."""
+    versuche = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal versuche
+        versuche += 1
+        if versuche < 2:
+            raise httpx.ReadTimeout("kurz weg")
+        return json_response(200, make_search_payload())
+
+    with make_client(handler) as client:
+        client.search("migration")
+
+    assert versuche == 2
+
+
+def test_store_retryt_connect_timeout_vor_antwort() -> None:
+    """`ConnectTimeout`/`PoolTimeout` beweisen wie `ConnectError`, dass der
+    Server nichts sah — auch für `store()` sicher retryable."""
+    versuche = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal versuche
+        versuche += 1
+        if versuche < 2:
+            raise httpx.ConnectTimeout("Verbindung kam nie zustande")
+        return json_response(201, make_submission_payload())
+
+    with make_client(handler) as client:
+        ergebnis = client.store(
+            project=str(__import__("uuid").uuid4()),
+            title="Titel",
+            content="Inhalt",
+            source="test",
+        )
+
+    assert ergebnis.verdict == "stored"
+    assert versuche == 2
+
+
 def test_store_wiederholt_5xx_nach_antwort_nicht() -> None:
     """Der Kern von Entscheidung 5: Ein 500 *nach* Serverantwort ist für
     `store()` nicht automatisch retryable — der Server könnte bereits

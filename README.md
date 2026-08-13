@@ -8,7 +8,7 @@ installieren. Einzige Laufzeit-Abhängigkeit: [httpx](https://www.python-httpx.o
 ## Installation
 
 ```bash
-pip install "dbrain @ git+https://github.com/julianhyatt/developers-brain-sdk.git@v0.1.0"
+pip install "dbrain @ git+https://github.com/julianhyatt/developers-brain-sdk.git@v0.1.1"
 ```
 
 Immer gegen einen Tag installieren, nie gegen `@main` — sonst installieren
@@ -92,8 +92,8 @@ with BrainClient("https://brain.example.internal", token) as client:
     if urteil.verdict == "rejected":
         for befund in urteil.findings:
             print(befund.severity, befund.hint)
-
-    client.feedback(urteil.entry_id, helpful=True)
+    elif urteil.entry_id is not None:  # nicht bei "merged" — dort None
+        client.feedback(urteil.entry_id, helpful=True)
 ```
 
 ### Fehlerbehandlung

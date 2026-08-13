@@ -58,6 +58,16 @@ def test_env_gewinnt_gegen_config_datei(
     assert konfiguration.token == "datei-token"
 
 
+def test_korrupte_toml_wirft_config_error_statt_traceback(tmp_path: Path) -> None:
+    """Ein kaputtes TOML durfte nicht als unbehandelter
+    `tomllib.TOMLDecodeError` bis zur CLI durchschlagen."""
+    datei = tmp_path / "kaputt.toml"
+    datei.write_text("base_url = [ohne schließende Klammer\n")
+
+    with pytest.raises(ConfigError):
+        resolve(config_path=datei)
+
+
 def test_ohne_url_wirft_config_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

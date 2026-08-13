@@ -34,8 +34,13 @@ class Config:
 def _read_file(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
-    with path.open("rb") as datei:
-        return tomllib.load(datei)
+    try:
+        with path.open("rb") as datei:
+            return tomllib.load(datei)
+    except tomllib.TOMLDecodeError as fehler:
+        raise ConfigError(
+            f"Config-Datei {path} ist kein gültiges TOML: {fehler}"
+        ) from fehler
 
 
 def resolve(
