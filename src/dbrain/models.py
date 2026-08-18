@@ -154,6 +154,50 @@ class FeedbackResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewEntry:
+    """Ein Eintrag aus Kuratierungssicht — dieselbe Form für einen Eintrag
+    aus `list_review_queue()` wie für das Ergebnis von `approve_review()`/
+    `reject_review()`/`edit_review()`: Alle vier REST-Routen
+    (`GET`/`POST .../approve`/`POST .../reject`/`PATCH`) antworten mit
+    demselben `ReviewQueueEntryOut` (`app/api/review.py` im Server-Repo)."""
+
+    entry_id: uuid.UUID
+    project_id: uuid.UUID
+    title: str
+    content: str
+    category: str | None
+    tags: tuple[str, ...]
+    evidence: tuple[str, ...]
+    source: str
+    confidence: float
+    status: str
+    superseded_by: uuid.UUID | None
+    created_by: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def _from_json(cls, data: dict[str, Any]) -> ReviewEntry:
+        superseded_by = data.get("superseded_by")
+        return cls(
+            entry_id=uuid.UUID(data["entry_id"]),
+            project_id=uuid.UUID(data["project_id"]),
+            title=data["title"],
+            content=data["content"],
+            category=data.get("category"),
+            tags=tuple(data.get("tags", ())),
+            evidence=tuple(data.get("evidence", ())),
+            source=data["source"],
+            confidence=data["confidence"],
+            status=data["status"],
+            superseded_by=uuid.UUID(superseded_by) if superseded_by else None,
+            created_by=uuid.UUID(data["created_by"]),
+            created_at=datetime.fromisoformat(data["created_at"]),
+            updated_at=datetime.fromisoformat(data["updated_at"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Project:
     """Ein Projekt, in dem dieses Token arbeiten darf (`GET /v1/projects`)."""
 

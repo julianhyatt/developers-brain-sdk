@@ -6,21 +6,23 @@
 `search()` und `list_projects()` sind ohne Nebenwirkung — jeder
 Verbindungsfehler, Timeout oder 5xx wird bedenkenlos wiederholt.
 
-`store()` und `feedback()` schreiben, und die Unterscheidung, die zählt,
-ist nicht *welcher* Fehler auftrat, sondern *ob beweisbar ist*, dass der
-Request den Server nie erreicht hat:
+`store()`, `feedback()` und die drei schreibenden Kuratierungsaufrufe
+(`approve_review()`/`reject_review()`/`edit_review()`, #93) schreiben, und
+die Unterscheidung, die zählt, ist nicht *welcher* Fehler auftrat, sondern
+*ob beweisbar ist*, dass der Request den Server nie erreicht hat:
 
 - `ConnectError`/`ConnectTimeout`/`PoolTimeout` — die Verbindung kam nie
-  zustande, der Server hat vom Request nichts gesehen. Retryable, für
-  alle vier Methoden.
+  zustande, der Server hat vom Request nichts gesehen. Retryable, für jede
+  Methode, ob lesend oder schreibend.
 - `ReadTimeout`/`WriteTimeout`/sonstige `TransportError` **nach**
   aufgebauter Verbindung — der Request könnte bereits vollständig
   gesendet und verarbeitet worden sein, das SDK kann es nicht
-  unterscheiden. Für `search()`/`list_projects()` unbedenklich (kein
-  Nebeneffekt); für `store()`/`feedback()` **nicht automatisch
-  retryable** — dieselbe Ambiguität wie unten, als `BrainAmbiguousError`.
+  unterscheiden. Für die lesenden Methoden (`search()`, `list_projects()`,
+  `list_review_queue()`) unbedenklich (kein Nebeneffekt); für die
+  schreibenden **nicht automatisch retryable** — dieselbe Ambiguität wie
+  unten, als `BrainAmbiguousError`.
 - Ein 5xx-Statuscode, also eine Antwort kam an, nur eine schlechte, heißt
-  für `store()`/`feedback()`: unklar, ob committet wurde, bevor der
+  für eine schreibende Methode: unklar, ob committet wurde, bevor der
   Fehler zurückkam. **Nicht automatisch retryable** — das wird als
   `BrainAmbiguousError` durchgereicht statt automatisch wiederholt.
 
@@ -44,7 +46,13 @@ from typing import Any, Self
 import httpx
 
 from . import exceptions as exc
-from .models import FeedbackResult, Project, SearchResult, SubmissionResult
+from .models import (
+    FeedbackResult,
+    Project,
+    ReviewEntry,
+    SearchResult,
+    SubmissionResult,
+)
 
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_MAX_RETRIES = 3
@@ -217,6 +225,106 @@ class BrainClient:
             raise _fehler_aus_antwort(response)
         return [Project._from_json(p) for p in response.json()["projects"]]
 
+    # -- Kuration (#93) — `maintainer`-Rolle im Zielprojekt vorausgesetzt --
+
+    def list_review_queue(
+        self, project: str, *, limit: int | None = None, offset: int | None = None
+    ) -> list[ReviewEntry]:
+        """`GET /v1/projects/{project_id}/review-queue` — wartende
+        Einträge (`pending_review`), älteste zuletzt. `project` wie bei
+        `store()`: Slug oder UUID."""
+        project_id = self._resolve_project_id(project)
+        params: dict[str, Any] = {}
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
+
+        response = self._send(
+            "GET",
+            f"/v1/projects/{project_id}/review-queue",
+            params=params or None,
+            idempotent=True,
+        )
+        if response.status_code >= 400:
+            raise _fehler_aus_antwort(response)
+        return [ReviewEntry._from_json(eintrag) for eintrag in response.json()]
+
+    def approve_review(self, project: str, entry_id: uuid.UUID | str) -> ReviewEntry:
+        """`POST .../review-queue/{entry_id}/approve` —
+        `pending_review` → `active`. Wirkt nur aus `pending_review`
+        heraus; alles andere ist eine `BrainHTTPError` (409 am Server —
+        der Eintrag steht nicht zur Prüfung)."""
+        project_id = self._resolve_project_id(project)
+        response = self._send(
+            "POST",
+            f"/v1/projects/{project_id}/review-queue/{entry_id}/approve",
+            idempotent=False,
+        )
+        if response.status_code >= 400:
+            raise _fehler_aus_antwort(response)
+        return ReviewEntry._from_json(response.json())
+
+    def reject_review(self, project: str, entry_id: uuid.UUID | str) -> ReviewEntry:
+        """`POST .../review-queue/{entry_id}/reject` —
+        `pending_review` → `archived`. Anders als ein abgelehntes
+        `store()` ist das hier eine **erfolgreiche** Kuratierungsentscheidung,
+        kein gescheiterter Versuch — siehe `dbrain review reject`s
+        Exit-Code."""
+        project_id = self._resolve_project_id(project)
+        response = self._send(
+            "POST",
+            f"/v1/projects/{project_id}/review-queue/{entry_id}/reject",
+            idempotent=False,
+        )
+        if response.status_code >= 400:
+            raise _fehler_aus_antwort(response)
+        return ReviewEntry._from_json(response.json())
+
+    def edit_review(
+        self,
+        project: str,
+        entry_id: uuid.UUID | str,
+        *,
+        title: str | None = None,
+        content: str | None = None,
+        category: str | None = None,
+        tags: list[str] | None = None,
+        confidence: float | None = None,
+        superseded_by: uuid.UUID | str | None = None,
+    ) -> ReviewEntry:
+        """`PATCH .../review-queue/{entry_id}` — ändert den Status nicht,
+        auch nicht für einen längst `active` Eintrag. Nur gesetzte
+        Argumente ändern sich; `None` heißt „unverändert lassen" — es gibt
+        keinen Weg, `superseded_by` über diesen Aufruf explizit wieder zu
+        löschen, dieselbe Grenze wie am Server (`app/api/review.py`,
+        `ReviewEdit`)."""
+        project_id = self._resolve_project_id(project)
+        body: dict[str, Any] = {}
+        for feld, wert in (
+            ("title", title),
+            ("content", content),
+            ("category", category),
+            ("tags", tags),
+            ("confidence", confidence),
+            (
+                "superseded_by",
+                str(superseded_by) if superseded_by is not None else None,
+            ),
+        ):
+            if wert is not None:
+                body[feld] = wert
+
+        response = self._send(
+            "PATCH",
+            f"/v1/projects/{project_id}/review-queue/{entry_id}",
+            json=body,
+            idempotent=False,
+        )
+        if response.status_code >= 400:
+            raise _fehler_aus_antwort(response)
+        return ReviewEntry._from_json(response.json())
+
     # -- intern --------------------------------------------------------
 
     def _resolve_project_id(self, project: str) -> str:
@@ -232,7 +340,12 @@ class BrainClient:
         )
 
     def _send(
-        self, method: str, path: str, *, json: dict[str, Any] | None = None,
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
         idempotent: bool,
     ) -> httpx.Response:
         """Transport-Retry — 429 und Verbindungsfehler vor jeder Antwort
@@ -254,7 +367,7 @@ class BrainClient:
         while True:
             versuch += 1
             try:
-                response = self._client.request(method, path, json=json)
+                response = self._client.request(method, path, json=json, params=params)
             except (
                 httpx.ConnectError,
                 httpx.ConnectTimeout,

@@ -64,12 +64,23 @@ cat notiz.md | dbrain store --project backend --title "Titel" --source ci-agent
 
 # Feedback abgeben
 dbrain feedback <entry-id> --helpful --comment "hat geholfen"
+
+# Kuration (#93, braucht mindestens maintainer im Zielprojekt)
+dbrain review list --project backend
+dbrain review approve --project backend --entry <entry-id>
+dbrain review reject --project backend --entry <entry-id>
+dbrain review edit --project backend --entry <entry-id> \
+  --superseded-by <ersetzender-entry-id>
 ```
 
 Jeder Unterbefehl unterstützt `--json` für maschinenlesbare Ausgabe;
 ohne das Flag ist die Ausgabe menschenlesbarer Text. `store` liefert
 Exit-Code `1`, wenn die Einreichung `rejected` wurde — der Grund steht
-in den ausgegebenen `findings`, kein separater Fehlerpfad.
+in den ausgegebenen `findings`, kein separater Fehlerpfad. `review
+reject` ist davon bewusst verschieden: Anders als eine abgelehnte
+Einreichung ist ein Review-`reject` eine **erfolgreiche**
+Kuratierungsentscheidung und liefert Exit-Code `0`; Exit `1` bedeutet bei
+`review` ausschließlich einen echten Fehler (Auth, Netz, HTTP).
 
 ## SDK
 
@@ -83,7 +94,7 @@ with BrainClient("https://brain.example.internal", token) as client:
 
     urteil = client.store(
         project="backend",  # Slug oder UUID — ein Slug wird über
-                             # GET /v1/projects aufgelöst
+        # GET /v1/projects aufgelöst
         title="Alembic-Downgrade scheitert bei nativen Enums",
         content="…",
         source="ci-agent",
@@ -94,6 +105,10 @@ with BrainClient("https://brain.example.internal", token) as client:
             print(befund.severity, befund.hint)
     elif urteil.entry_id is not None:  # nicht bei "merged" — dort None
         client.feedback(urteil.entry_id, helpful=True)
+
+    # Kuration (#93) — dieselbe maintainer-Rolle wie bei `dbrain review`
+    for wartend in client.list_review_queue("backend"):
+        client.approve_review("backend", wartend.entry_id)
 ```
 
 ### Fehlerbehandlung
