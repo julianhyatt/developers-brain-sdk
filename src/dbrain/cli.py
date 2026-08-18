@@ -25,6 +25,25 @@ from .exceptions import BrainError
 from .models import FeedbackResult, Project, SearchResult, SubmissionResult
 
 
+def _normalisiere_tags(werte: list[str] | None) -> list[str] | None:
+    """Splittet jeden `--tag`-Wert zusätzlich an Kommas.
+
+    `--tag` ist wiederholbar (`action="append"`), aber ein einzelner Aufruf
+    wie `--tag "a,b,c"` sah bisher aus wie ein Erfolg und landete klaglos
+    als EIN Tag `"a,b,c"` — die serverseitige Filterung (`tags @> [...]`)
+    verlangt exakte Array-Elemente und fand ihn danach nie wieder.
+    """
+    if werte is None:
+        return None
+    ergebnis: list[str] = []
+    for wert in werte:
+        for teil in wert.split(","):
+            teil = teil.strip()
+            if teil and teil not in ergebnis:
+                ergebnis.append(teil)
+    return ergebnis
+
+
 def _jsonable(wert: Any) -> Any:
     if dataclasses.is_dataclass(wert) and not isinstance(wert, type):
         wert = dataclasses.asdict(wert)
@@ -159,6 +178,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command in ("search", "store"):
+        args.tags = _normalisiere_tags(args.tags)
 
     try:
         konfiguration = resolve(

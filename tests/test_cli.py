@@ -7,6 +7,7 @@ in `tests/conftest.py`, nur von der CLI-Seite aus angestoßen.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 
 import httpx
@@ -105,6 +106,63 @@ def test_store_rejected_gibt_exit_code_1(
 
     assert code == 1
     assert "verdict=rejected" in capsys.readouterr().out
+
+
+def test_store_tag_kommagetrennt_wird_gesplittet(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression für Issue #1: `--tag "a,b"` muss wie `--tag a --tag b`
+    wirken, sonst findet die serverseitige `tags @> [...]`-Filterung
+    (exakte Array-Elemente) den Eintrag nie wieder."""
+    import uuid
+
+    gesehene_tags: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        gesehene_tags.append(body.get("tags"))
+        return json_response(200, make_submission_payload())
+
+    _patch_transport(monkeypatch, handler)
+
+    code = cli.main(
+        [
+            "store",
+            "--project",
+            str(uuid.uuid4()),
+            "--title",
+            "t",
+            "--content",
+            "c",
+            "--source",
+            "s",
+            "--tag",
+            "react,html, formulare ,ticket-17",
+            "--tag",
+            "react",
+        ]
+    )
+
+    assert code == 0
+    assert gesehene_tags[-1] == ["react", "html", "formulare", "ticket-17"]
+
+
+def test_search_tag_kommagetrennt_wird_gesplittet(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gesehene_tags: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        gesehene_tags.append(body.get("tags"))
+        return json_response(200, make_search_payload())
+
+    _patch_transport(monkeypatch, handler)
+
+    code = cli.main(["search", "migration", "--tag", "a,b"])
+
+    assert code == 0
+    assert gesehene_tags[-1] == ["a", "b"]
 
 
 def test_fehlende_konfiguration_gibt_exit_code_1(
