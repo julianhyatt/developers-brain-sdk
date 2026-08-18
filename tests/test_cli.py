@@ -18,6 +18,7 @@ from tests.conftest import (
     json_response,
     make_hit,
     make_project_payload,
+    make_review_entry_payload,
     make_search_payload,
     make_submission_payload,
 )
@@ -133,6 +134,123 @@ def test_projects_menschenlesbar(
 
     assert code == 0
     assert "A" in capsys.readouterr().out
+
+
+def test_review_list_menschenlesbar(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import uuid
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(200, [make_review_entry_payload(title="Wartend")])
+
+    _patch_transport(monkeypatch, handler)
+
+    code = cli.main(["review", "list", "--project", str(uuid.uuid4())])
+
+    assert code == 0
+    ausgabe = capsys.readouterr().out
+    assert "Wartend" in ausgabe
+    assert "{" not in ausgabe
+
+
+def test_review_approve_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import uuid
+
+    entry_id = uuid.uuid4()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(
+            200, make_review_entry_payload(entry_id=str(entry_id), status="active")
+        )
+
+    _patch_transport(monkeypatch, handler)
+
+    code = cli.main(
+        [
+            "--json",
+            "review",
+            "approve",
+            "--project",
+            str(uuid.uuid4()),
+            "--entry",
+            str(entry_id),
+        ]
+    )
+
+    assert code == 0
+    assert '"status": "active"' in capsys.readouterr().out
+
+
+def test_review_reject_gibt_exit_code_0(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Anders als ein abgelehntes `store` ist ein Review-`reject` eine
+    **erfolgreiche** Kuratierungsentscheidung — Exit 0, nicht 1."""
+    import uuid
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(200, make_review_entry_payload(status="archived"))
+
+    _patch_transport(monkeypatch, handler)
+
+    code = cli.main(
+        [
+            "review",
+            "reject",
+            "--project",
+            str(uuid.uuid4()),
+            "--entry",
+            str(uuid.uuid4()),
+        ]
+    )
+
+    assert code == 0
+    assert "status=archived" in capsys.readouterr().out
+
+
+def test_review_edit_superseded_by(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import uuid
+
+    ersetzt_durch = uuid.uuid4()
+    aufgezeichnete_koerper: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            import json as _json
+
+            aufgezeichnete_koerper.append(_json.loads(request.content))
+        return json_response(
+            200, make_review_entry_payload(superseded_by=str(ersetzt_durch))
+        )
+
+    _patch_transport(monkeypatch, handler)
+
+    code = cli.main(
+        [
+            "review",
+            "edit",
+            "--project",
+            str(uuid.uuid4()),
+            "--entry",
+            str(uuid.uuid4()),
+            "--superseded-by",
+            str(ersetzt_durch),
+        ]
+    )
+
+    assert code == 0
+    assert f"superseded_by={ersetzt_durch}" in capsys.readouterr().out
+    assert aufgezeichnete_koerper == [{"superseded_by": str(ersetzt_durch)}]
+
+
+def test_review_erfordert_unterbefehl(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["review"])
 
 
 def test_kein_token_flag_im_parser() -> None:

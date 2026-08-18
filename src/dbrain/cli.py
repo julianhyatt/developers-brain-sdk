@@ -1,9 +1,10 @@
 """`dbrain` — Kommandozeilenwerkzeug über `BrainClient`.
 
-`argparse`, keine neue Laufzeit-Abhängigkeit: Das Projekt hat drei
-Unterbefehle, und `argparse`-Subparser sind dafür ohne Mehraufwand
-ausreichend — kein Grund, für „dünn" Typer/Click als zwei zusätzliche
-Abhängigkeiten hereinzuholen.
+`argparse`, keine neue Laufzeit-Abhängigkeit: Das Projekt hat eine
+Handvoll Unterbefehle (`review` mit eigenen Unter-Unterbefehlen seit
+#93), und `argparse`-Subparser sind dafür ohne Mehraufwand ausreichend —
+kein Grund, für „dünn" Typer/Click als zwei zusätzliche Abhängigkeiten
+hereinzuholen.
 """
 
 from __future__ import annotations
@@ -22,7 +23,13 @@ from . import __version__
 from .client import BrainClient
 from .config import DEFAULT_CONFIG_PATH, ConfigError, resolve
 from .exceptions import BrainError
-from .models import FeedbackResult, Project, SearchResult, SubmissionResult
+from .models import (
+    FeedbackResult,
+    Project,
+    ReviewEntry,
+    SearchResult,
+    SubmissionResult,
+)
 
 
 def _jsonable(wert: Any) -> Any:
@@ -44,8 +51,10 @@ def _print_search(ergebnis: SearchResult) -> None:
         print("Keine Treffer.")
         return
     for treffer in ergebnis.hits:
-        print(f"{treffer.score:.3f}  {treffer.project_slug}/{treffer.title}"
-              f"  ({treffer.entry_id})")
+        print(
+            f"{treffer.score:.3f}  {treffer.project_slug}/{treffer.title}"
+            f"  ({treffer.entry_id})"
+        )
         print(f"    {treffer.snippet}")
     print(f"\n{len(ergebnis.hits)} Treffer, Begriffe: {', '.join(ergebnis.terms)}")
 
@@ -76,6 +85,25 @@ def _print_projects(projekte: list[Project]) -> None:
         print(f"{projekt.slug}\t{projekt.name}\t{projekt.role}{archiv}")
 
 
+def _print_review_queue(eintraege: list[ReviewEntry]) -> None:
+    if not eintraege:
+        print("Keine wartenden Einträge.")
+        return
+    for eintrag in eintraege:
+        ersetzt = (
+            f" superseded_by={eintrag.superseded_by}" if eintrag.superseded_by else ""
+        )
+        print(
+            f"{eintrag.entry_id}  {eintrag.title}  (status={eintrag.status}){ersetzt}"
+        )
+
+
+def _print_review_entry(eintrag: ReviewEntry) -> None:
+    print(f"entry_id={eintrag.entry_id} status={eintrag.status}")
+    if eintrag.superseded_by is not None:
+        print(f"superseded_by={eintrag.superseded_by}")
+
+
 def _output(wert: Any, *, als_json: bool, menschlich: Callable[[Any], None]) -> None:
     if als_json:
         print(json.dumps(_jsonable(wert), indent=2, ensure_ascii=False))
@@ -87,9 +115,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dbrain", description="Client für developers-brain"
     )
-    parser.add_argument(
-        "--url", help="Server-URL (sonst DBRAIN_URL oder Config-Datei)"
-    )
+    parser.add_argument("--url", help="Server-URL (sonst DBRAIN_URL oder Config-Datei)")
     parser.add_argument(
         "--token-stdin",
         action="store_true",
@@ -105,9 +131,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json", action="store_true", help="Ausgabe als JSON statt menschenlesbar"
     )
-    parser.add_argument(
-        "--version", action="version", version=f"dbrain {__version__}"
-    )
+    parser.add_argument("--version", action="version", version=f"dbrain {__version__}")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -139,9 +163,7 @@ def _build_parser() -> argparse.ArgumentParser:
     einreichen.add_argument("--source", required=True)
     einreichen.add_argument("--category")
     einreichen.add_argument("--tag", action="append", dest="tags", default=[])
-    einreichen.add_argument(
-        "--evidence", action="append", dest="evidence", default=[]
-    )
+    einreichen.add_argument("--evidence", action="append", dest="evidence", default=[])
     einreichen.add_argument("--confidence", type=float, default=0.5)
 
     feedback = sub.add_parser("feedback", help="Feedback zu einem Eintrag abgeben")
@@ -152,6 +174,52 @@ def _build_parser() -> argparse.ArgumentParser:
     feedback.add_argument("--comment")
 
     sub.add_parser("projects", help="Effektive Projektmenge anzeigen")
+
+    review = sub.add_parser(
+        "review", help="Kuration der Review-Queue (#93, braucht maintainer)"
+    )
+    review_sub = review.add_subparsers(dest="review_command", required=True)
+
+    review_list = review_sub.add_parser("list", help="Wartende Einträge anzeigen")
+    review_list.add_argument(
+        "--project", required=True, help="Projekt (Slug oder UUID)"
+    )
+    review_list.add_argument("--limit", type=int)
+    review_list.add_argument("--offset", type=int)
+
+    review_approve = review_sub.add_parser(
+        "approve", help="Eintrag freigeben — pending_review → active"
+    )
+    review_approve.add_argument(
+        "--project", required=True, help="Projekt (Slug oder UUID)"
+    )
+    review_approve.add_argument("--entry", required=True, dest="entry_id")
+
+    review_reject = review_sub.add_parser(
+        "reject", help="Eintrag zurückweisen — pending_review → archived"
+    )
+    review_reject.add_argument(
+        "--project", required=True, help="Projekt (Slug oder UUID)"
+    )
+    review_reject.add_argument("--entry", required=True, dest="entry_id")
+
+    review_edit = review_sub.add_parser(
+        "edit", help="Eintrag redigieren — ändert den Status nicht"
+    )
+    review_edit.add_argument(
+        "--project", required=True, help="Projekt (Slug oder UUID)"
+    )
+    review_edit.add_argument("--entry", required=True, dest="entry_id")
+    review_edit.add_argument("--title")
+    review_edit.add_argument("--content")
+    review_edit.add_argument("--category")
+    review_edit.add_argument("--tag", action="append", dest="tags")
+    review_edit.add_argument("--confidence", type=float)
+    review_edit.add_argument(
+        "--superseded-by",
+        dest="superseded_by",
+        help="Kennung des Eintrags, der diesen ersetzt (#93)",
+    )
 
     return parser
 
@@ -218,11 +286,55 @@ def main(argv: list[str] | None = None) -> int:
                 projekte = client.list_projects()
                 _output(projekte, als_json=args.json, menschlich=_print_projects)
                 return 0
+
+            if args.command == "review":
+                if args.review_command == "list":
+                    eintraege = client.list_review_queue(
+                        args.project, limit=args.limit, offset=args.offset
+                    )
+                    _output(
+                        eintraege, als_json=args.json, menschlich=_print_review_queue
+                    )
+                    return 0
+
+                if args.review_command == "approve":
+                    ergebnis = client.approve_review(args.project, args.entry_id)
+                    _output(
+                        ergebnis, als_json=args.json, menschlich=_print_review_entry
+                    )
+                    return 0
+
+                if args.review_command == "reject":
+                    # Anders als `store`s `rejected`-Verdict ist das hier
+                    # eine erfolgreiche Kuratierungsentscheidung, kein
+                    # gescheiterter Versuch — Exit 0 bei Erfolg, dieselbe
+                    # normale Fehlerbehandlung wie jeder andere Aufruf.
+                    ergebnis = client.reject_review(args.project, args.entry_id)
+                    _output(
+                        ergebnis, als_json=args.json, menschlich=_print_review_entry
+                    )
+                    return 0
+
+                if args.review_command == "edit":
+                    ergebnis = client.edit_review(
+                        args.project,
+                        args.entry_id,
+                        title=args.title,
+                        content=args.content,
+                        category=args.category,
+                        tags=args.tags,
+                        confidence=args.confidence,
+                        superseded_by=args.superseded_by,
+                    )
+                    _output(
+                        ergebnis, als_json=args.json, menschlich=_print_review_entry
+                    )
+                    return 0
         except BrainError as fehler:
             print(f"Fehler: {fehler}", file=sys.stderr)
             return 1
 
-    return 1  # unerreichbar bei bekanntem Subcommand — argparse erzwingt einen der vier
+    return 1  # unerreichbar bei bekanntem Subcommand — argparse erzwingt einen gültigen
 
 
 if __name__ == "__main__":

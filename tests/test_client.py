@@ -26,6 +26,7 @@ from tests.conftest import (
     make_client,
     make_hit,
     make_project_payload,
+    make_review_entry_payload,
     make_search_payload,
     make_submission_payload,
 )
@@ -303,8 +304,9 @@ def test_429_gibt_nach_max_retries_brain_rate_limit_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(429, headers={"Retry-After": "0"})
 
-    with make_client(handler, max_retries=1) as client, pytest.raises(
-        BrainRateLimitError
+    with (
+        make_client(handler, max_retries=1) as client,
+        pytest.raises(BrainRateLimitError),
     ):
         client.search("migration")
 
@@ -313,8 +315,9 @@ def test_verbindungsfehler_gibt_nach_max_retries_auf() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("kaputt")
 
-    with make_client(handler, max_retries=1) as client, pytest.raises(
-        BrainConnectionError
+    with (
+        make_client(handler, max_retries=1) as client,
+        pytest.raises(BrainConnectionError),
     ):
         client.search("migration")
 
@@ -365,6 +368,109 @@ def test_store_mit_unbekanntem_slug_wirft_not_found() -> None:
         client.store(
             project="unbekannt", title="Titel", content="Inhalt", source="test"
         )
+
+
+def test_list_review_queue_gibt_wartende_eintraege_zurueck() -> None:
+    import uuid
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(200, [make_review_entry_payload(title="Wartend")])
+
+    with make_client(handler) as client:
+        eintraege = client.list_review_queue(str(uuid.uuid4()))
+
+    assert len(eintraege) == 1
+    assert eintraege[0].title == "Wartend"
+    assert eintraege[0].status == "pending_review"
+
+
+def test_list_review_queue_traegt_limit_offset_als_query_parameter() -> None:
+    import uuid
+
+    aufgezeichnete_query: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        aufgezeichnete_query.update(dict(request.url.params))
+        return json_response(200, [])
+
+    with make_client(handler) as client:
+        client.list_review_queue(str(uuid.uuid4()), limit=5, offset=10)
+
+    assert aufgezeichnete_query == {"limit": "5", "offset": "10"}
+
+
+def test_list_review_queue_retryt_5xx_wie_search() -> None:
+    """Ohne Nebenwirkung wie `search()`/`list_projects()` — ein 5xx wird
+    bedenkenlos retryt."""
+    import uuid
+
+    versuche = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal versuche
+        versuche += 1
+        if versuche < 2:
+            return httpx.Response(503)
+        return json_response(200, [])
+
+    with make_client(handler) as client:
+        client.list_review_queue(str(uuid.uuid4()))
+
+    assert versuche == 2
+
+
+def test_approve_review_gibt_aktualisierten_eintrag_zurueck() -> None:
+    import uuid
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(200, make_review_entry_payload(status="active"))
+
+    with make_client(handler) as client:
+        ergebnis = client.approve_review(str(uuid.uuid4()), uuid.uuid4())
+
+    assert ergebnis.status == "active"
+
+
+def test_reject_review_schreibt_kein_zweites_mal_bei_5xx_nach_antwort() -> None:
+    """Dieselbe Ambiguitäts-Regel wie `store()`/`feedback()`: Ein 500
+    *nach* einer Antwort ist für eine schreibende Kuratierungsaktion nicht
+    automatisch retryable."""
+    import uuid
+
+    versuche = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal versuche
+        versuche += 1
+        return httpx.Response(500, text="kaputt")
+
+    with make_client(handler) as client, pytest.raises(BrainAmbiguousError):
+        client.reject_review(str(uuid.uuid4()), uuid.uuid4())
+
+    assert versuche == 1
+
+
+def test_edit_review_sendet_nur_gesetzte_felder() -> None:
+    import uuid
+
+    ersetzt_durch = uuid.uuid4()
+    aufgezeichnete_koerper: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        aufgezeichnete_koerper.append(_json.loads(request.content))
+        return json_response(
+            200, make_review_entry_payload(superseded_by=str(ersetzt_durch))
+        )
+
+    with make_client(handler) as client:
+        ergebnis = client.edit_review(
+            str(uuid.uuid4()), uuid.uuid4(), superseded_by=ersetzt_durch
+        )
+
+    assert ergebnis.superseded_by == ersetzt_durch
+    assert aufgezeichnete_koerper == [{"superseded_by": str(ersetzt_durch)}]
 
 
 def test_list_projects_toleriert_unbekannte_felder() -> None:

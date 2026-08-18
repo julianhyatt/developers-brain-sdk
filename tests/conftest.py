@@ -106,3 +106,28 @@ def make_project_payload(**overrides: object) -> dict[str, object]:
     }
     payload.update(overrides)
     return payload
+
+
+def make_review_entry_payload(**overrides: object) -> dict[str, object]:
+    """Die Form von `ReviewQueueEntryOut` (`app/api/review.py` im
+    Server-Repo, #93) — identisch für einen Eintrag aus `GET
+    .../review-queue`, `POST .../approve`, `POST .../reject` und `PATCH
+    .../review-queue/{id}`."""
+    payload: dict[str, object] = {
+        "entry_id": str(uuid.uuid4()),
+        "project_id": str(uuid.uuid4()),
+        "title": "Titel",
+        "content": "Inhalt",
+        "category": None,
+        "tags": [],
+        "evidence": [],
+        "source": "test",
+        "confidence": 0.5,
+        "status": "pending_review",
+        "superseded_by": None,
+        "created_by": str(uuid.uuid4()),
+        "created_at": datetime.now(UTC).isoformat(),
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    payload.update(overrides)
+    return payload
