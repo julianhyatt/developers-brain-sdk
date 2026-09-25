@@ -154,7 +154,7 @@ und mindestens die Rolle `maintainer`.
 ## SDK
 
 ```python
-from dbrain import BrainClient
+from dbrain import BrainClient, SyncEntry
 
 with BrainClient("https://brain.example.internal", token) as client:
     ergebnis = client.search("datenbankmigration", limit=5)
@@ -207,8 +207,6 @@ with BrainClient("https://brain.example.internal", token) as client:
     if suche.degraded:  # Vektorzweig ausgefallen — nur Volltext-Treffer
         print("Hinweis: Umschreibungen können fehlen")
 ```
-
-`SyncEntry` gehört zu `from dbrain import BrainClient, SyncEntry`.
 
 ### Fehlerbehandlung
 

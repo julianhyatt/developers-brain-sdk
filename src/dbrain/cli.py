@@ -190,7 +190,9 @@ def _lade_manifest(
         text = sys.stdin.read()
     else:
         try:
-            text = Path(pfad).read_text(encoding="utf-8")
+            # `utf-8-sig`: Ein Editor, der ein BOM schreibt, soll nicht als
+            # „kein gültiges JSON" enden.
+            text = Path(pfad).read_text(encoding="utf-8-sig")
         except OSError as fehler:
             raise ManifestError(f"Manifest nicht lesbar: {fehler}") from fehler
     try:

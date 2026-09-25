@@ -54,6 +54,7 @@ Urteil `merged` lauten, obwohl schon der erste Versuch geschrieben hat.
 
 from __future__ import annotations
 
+import math
 import random
 import time
 import uuid
@@ -86,6 +87,12 @@ SYNC_TIMEOUT = 300.0
 # antwortet dann mit 409 und `Retry-After`. Der Vorgabe-Timeout von 10 s würde
 # genau dort abreißen; 30 s sind Sperrfrist plus Reserve für die Bearbeitung.
 UPSERT_TIMEOUT = 30.0
+# Längste Wartezeit, die ein `Retry-After` des Servers dem Client aufzwingen
+# darf. Ein Server, der `1e9` oder `inf` schickt (Fehlkonfiguration, feindlicher
+# Proxy), soll den Client nicht beliebig lange blockieren; eine Minute deckt
+# jede Wartezeit, die ein gesunder Server nennt (Sperrfrist 2 s, Rate-Limit
+# bis zum Ende des Minutenfensters).
+MAX_RETRY_AFTER = 60.0
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BACKOFF_BASE = 0.5
 BACKOFF_FACTOR = 2.0
@@ -240,6 +247,7 @@ class BrainClient:
         tags: list[str] | None = None,
         evidence: list[str] | None = None,
         confidence: float = 0.5,
+        timeout: float = UPSERT_TIMEOUT,
     ) -> SubmissionResult:
         """`PUT /v1/projects/{project_id}/entries/by-key/{external_key}`
         (#206) — legt den Eintrag unter dem Schlüssel an oder **ersetzt** ihn.
@@ -276,7 +284,7 @@ class BrainClient:
             f"/v1/projects/{project_id}/entries/by-key/{_pfadsegment(external_key)}",
             json=body,
             idempotent=True,
-            timeout=UPSERT_TIMEOUT,
+            timeout=timeout,
         )
         return _einreichungsergebnis(response)
 
@@ -513,8 +521,18 @@ class BrainClient:
         """
         # Nur setzen, wenn der Aufruf es verlangt — sonst gilt der Vorgabewert
         # des Clients (`httpx.USE_CLIENT_DEFAULT`, nicht `None`, wäre „kein
-        # Timeout").
-        optionen: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
+        # Timeout"). Ein float gälte für **alle** Phasen: Ein langer Sync
+        # ließe auch einen nicht erreichbaren Server bis zu 300 s auf die
+        # Verbindung warten, und die Retry-Semantik („Verbindung kam nie
+        # zustande → sofort wiederholen") würde stumpf. `connect` bleibt
+        # deshalb beim Vorgabewert des Clients.
+        optionen: dict[str, Any] = (
+            {}
+            if timeout is None
+            else {
+                "timeout": httpx.Timeout(timeout, connect=self._client.timeout.connect)
+            }
+        )
         versuch = 0
         while True:
             versuch += 1
@@ -586,11 +604,16 @@ class BrainClient:
         time.sleep(max(0.0, basis + jitter))
 
     def _warten_auf_retry_after(self, response: httpx.Response) -> None:
+        """Wartet die vom Server genannte Zeit — begrenzt auf
+        `MAX_RETRY_AFTER`. Nicht Lesbares (ein HTTP-Datum, `nan`, `inf`) gilt
+        wie ein fehlender Header: eine Sekunde; Negatives ist keine Wartezeit."""
         try:
             sekunden = float(response.headers.get("Retry-After", "1"))
         except ValueError:
             sekunden = 1.0
-        time.sleep(max(0.0, sekunden))
+        if not math.isfinite(sekunden):
+            sekunden = 1.0
+        time.sleep(min(max(0.0, sekunden), MAX_RETRY_AFTER))
 
 
 def _pfadsegment(external_key: str) -> str:

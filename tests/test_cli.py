@@ -721,3 +721,24 @@ def test_sync_manifest_von_stdin_und_token_stdin_schliessen_sich_aus(
     assert code == 1
     assert "beide von stdin" in capsys.readouterr().err
     assert gesehen == []
+
+
+def test_sync_liest_ein_manifest_mit_bom(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Ein Editor, der ein BOM schreibt, ist kein Grund für „kein gültiges
+    JSON"."""
+    gesehen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen.update(json.loads(request.content))
+        return json_response(200, make_sync_payload())
+
+    _patch_transport(monkeypatch, handler)
+    datei = tmp_path / "manifest.json"
+    datei.write_bytes(
+        b"\xef\xbb\xbf" + json.dumps({"source_revision": "r", "entries": []}).encode()
+    )
+
+    assert cli.main(_sync_argumente(datei)) == 0
+    assert gesehen["source_revision"] == "r"

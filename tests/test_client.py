@@ -15,7 +15,13 @@ import uuid
 import httpx
 import pytest
 
-from dbrain.client import SYNC_TIMEOUT, UPSERT_TIMEOUT, BrainClient
+from dbrain.client import (
+    DEFAULT_TIMEOUT,
+    MAX_RETRY_AFTER,
+    SYNC_TIMEOUT,
+    UPSERT_TIMEOUT,
+    BrainClient,
+)
 from dbrain.exceptions import (
     BrainAmbiguousError,
     BrainAuthError,
@@ -935,3 +941,73 @@ def test_antworten_ohne_die_neuen_felder_bleiben_lesbar() -> None:
 
     assert ergebnis.replaced is False
     assert ergebnis.external_key is None
+
+
+# --- Härtung: Retry-After begrenzt, connect-Timeout bleibt, upsert-Timeout -------
+
+
+@pytest.mark.parametrize(
+    ("header", "erwartet"),
+    [
+        ("1e9", MAX_RETRY_AFTER),  # feindlich oder fehlkonfiguriert: gedeckelt
+        ("inf", 1.0),  # nicht endlich → wie ein fehlender Header
+        ("nan", 1.0),
+        ("-5", 0.0),  # keine Wartezeit
+        ("Wed, 21 Oct 2026 07:28:00 GMT", 1.0),  # HTTP-Datum: nicht unterstützt
+        ("3", 3.0),
+    ],
+)
+def test_retry_after_wird_begrenzt_und_unlesbares_faellt_auf_eine_sekunde(
+    monkeypatch: pytest.MonkeyPatch, header: str, erwartet: float
+) -> None:
+    geschlafen: list[float] = []
+    monkeypatch.setattr("dbrain.client.time.sleep", geschlafen.append)
+    versuche = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal versuche
+        versuche += 1
+        if versuche == 1:
+            return httpx.Response(429, headers={"Retry-After": header})
+        return json_response(200, make_search_payload())
+
+    with make_client(handler) as client:
+        client.search("x")
+
+    assert geschlafen == [erwartet]
+
+
+def test_ein_aufruf_timeout_laesst_den_connect_timeout_des_clients_stehen() -> None:
+    """Ein float gälte für alle Phasen: Ein 300-s-Sync ließe einen nicht
+    erreichbaren Server 300 s auf die Verbindung warten."""
+    gesehen: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen.update(request.extensions["timeout"])
+        return json_response(200, make_sync_payload())
+
+    with make_client(handler) as client:
+        client.sync(str(uuid.uuid4()), source_revision="r", entries=[])
+
+    assert gesehen["read"] == SYNC_TIMEOUT
+    assert gesehen["connect"] == DEFAULT_TIMEOUT
+
+
+def test_upsert_timeout_ist_ueberschreibbar() -> None:
+    gesehen: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen["read"] = request.extensions["timeout"]["read"]
+        return json_response(201, make_submission_payload())
+
+    with make_client(handler) as client:
+        client.upsert(
+            project=str(uuid.uuid4()),
+            external_key="core.a",
+            title="Titel",
+            content="Inhalt",
+            source="ci",
+            timeout=120.0,
+        )
+
+    assert gesehen["read"] == 120.0
