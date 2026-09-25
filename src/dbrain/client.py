@@ -33,6 +33,23 @@ Request wurde nie verarbeitet, unabhängig von der Methode. Das SDK wartet
 dabei die vom Server genannte `Retry-After`-Zeit, nicht die eigene
 Backoff-Stufe — sonst unterbietet der Client absichtlich das Limit, das
 der Server gerade gesetzt hat.
+
+**409 mit `Retry-After` ist die zweite Ausnahme (#206)**, aus demselben
+Grund: Der Server antwortet so, wenn die Anfrage an einer Zeilensperre
+abgebrochen wurde (ein laufender Manifest-Sync im selben Projekt, ein
+Deadlock) — nichts wurde geschrieben, unabhängig von der Methode. Das
+`Retry-After` ist das Unterscheidungsmerkmal: Ein 409 **ohne** den Header
+ist ein fachlicher Konflikt (`approve_review()` auf einen Eintrag, der
+nicht zur Prüfung ansteht) und wird nie wiederholt.
+
+## `upsert()`, `remove()` und `sync()` sind idempotent
+
+Sie adressieren einen Zustand über einen Schlüssel, keine Aktion: Dieselbe
+Anfrage zweimal ausgeführt ergibt denselben Bestand (eine unveränderte
+Wiedereinreichung ist am Server ein No-Op, `merged`). Deshalb gilt für
+sie dieselbe Retry-Regel wie für `search()` — auch ein `ReadTimeout` oder
+5xx nach einer Antwort wird wiederholt. Preis: Nach einem Retry kann das
+Urteil `merged` lauten, obwohl schon der erste Versuch geschrieben hat.
 """
 
 from __future__ import annotations
@@ -40,8 +57,10 @@ from __future__ import annotations
 import random
 import time
 import uuid
+from collections.abc import Iterable
 from types import TracebackType
 from typing import Any, Self
+from urllib.parse import quote
 
 import httpx
 
@@ -52,9 +71,21 @@ from .models import (
     ReviewEntry,
     SearchResult,
     SubmissionResult,
+    SyncEntry,
+    SyncResult,
 )
 
 DEFAULT_TIMEOUT = 10.0
+# Ein Manifest-Sync mit vielen Einträgen läuft am Server Sekunden bis
+# Minuten (eine Transaktion, Sperren bis zum Commit) — der Vorgabe-Timeout
+# eines Suchaufrufs wäre hier ein Fehler, wo keiner ist. Passt zum
+# Proxy-Startwert der Server-Doku für den Sync-Pfad (300 s).
+SYNC_TIMEOUT = 300.0
+# Ein Upsert kann auf eine Zeile warten, die ein Sync oder der Embedding-
+# Worker gerade hält — der Server wartet höchstens seine Sperrfrist (10 s) und
+# antwortet dann mit 409 und `Retry-After`. Der Vorgabe-Timeout von 10 s würde
+# genau dort abreißen; 30 s sind Sperrfrist plus Reserve für die Bearbeitung.
+UPSERT_TIMEOUT = 30.0
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BACKOFF_BASE = 0.5
 BACKOFF_FACTOR = 2.0
@@ -115,11 +146,19 @@ class BrainClient:
         projects: list[str] | None = None,
         scope: str | None = None,
         context_project: str | None = None,
+        max_cosine_distance: float | None = None,
     ) -> SearchResult:
         """`POST /v1/search`. Feldnamen und Ausschlussregeln (`projects`
         vs. `scope`) bildet dieser Aufruf 1:1 auf `SearchRequest`
         (`app/api/search.py` im Server-Repo) ab — die Validierung liegt
-        dort, das SDK dupliziert sie nicht."""
+        dort, das SDK dupliziert sie nicht.
+
+        `max_cosine_distance` (#206) verengt die Relevanz-Schwelle des
+        Vektorzweigs für diese Anfrage — nur enger als die Grenze des
+        Servers, nie weiter (sonst 422). Sie hat nur eine Bedeutung, wenn
+        der Server mit einem echten Embedding-Modell läuft; gegen den
+        Platzhalter-Anbieter bleibt sie wirkungslos. Ob der Vektorzweig
+        überhaupt gelaufen ist, steht in `SearchResult.vector_branch`."""
         body: dict[str, Any] = {"query": query}
         for feld, wert in (
             ("limit", limit),
@@ -130,6 +169,7 @@ class BrainClient:
             ("projects", projects),
             ("scope", scope),
             ("context_project", context_project),
+            ("max_cosine_distance", max_cosine_distance),
         ):
             if wert is not None:
                 body[feld] = wert
@@ -186,18 +226,125 @@ class BrainClient:
             idempotent=False,
         )
 
-        if response.status_code in (200, 201):
-            return SubmissionResult._from_json(response.json())
+        return _einreichungsergebnis(response)
 
+    def upsert(
+        self,
+        *,
+        project: str,
+        external_key: str,
+        title: str,
+        content: str,
+        source: str,
+        category: str | None = None,
+        tags: list[str] | None = None,
+        evidence: list[str] | None = None,
+        confidence: float = 0.5,
+    ) -> SubmissionResult:
+        """`PUT /v1/projects/{project_id}/entries/by-key/{external_key}`
+        (#206) — legt den Eintrag unter dem Schlüssel an oder **ersetzt** ihn.
+
+        Für synchronisierte Quellen: Die Kennung des Eintrags bleibt über
+        Änderungen stabil (Feedback, Nutzungszähler und Zitate hängen daran),
+        Inhalt und Vektor sind neu. Eine unveränderte Wiedereinreichung ist
+        ein No-Op (`verdict == "merged"`). `result.replaced` sagt, ob ein
+        bestehender Eintrag ersetzt wurde. Nötig ist mindestens die Rolle
+        `maintainer`; in einem synchronisierten Projekt ist der Schlüssel
+        Pflicht für jeden Schreibzugriff.
+
+        Wie `store()`: Eine Ablehnung der Prüfstrecke (`rejected`) kommt als
+        normales Ergebnis zurück, nicht als Exception. Idempotent, siehe
+        Modul-Docstring — ein Retry kann `merged` melden, obwohl der erste
+        Versuch geschrieben hat.
+        """
+        project_id = self._resolve_project_id(project)
+        body: dict[str, Any] = {
+            "title": title,
+            "content": content,
+            "source": source,
+            "confidence": confidence,
+        }
+        if category is not None:
+            body["category"] = category
+        if tags is not None:
+            body["tags"] = tags
+        if evidence is not None:
+            body["evidence"] = evidence
+
+        response = self._send(
+            "PUT",
+            f"/v1/projects/{project_id}/entries/by-key/{_pfadsegment(external_key)}",
+            json=body,
+            idempotent=True,
+            timeout=UPSERT_TIMEOUT,
+        )
+        return _einreichungsergebnis(response)
+
+    def remove(self, project: str, external_key: str) -> None:
+        """`DELETE /v1/projects/{project_id}/entries/by-key/{external_key}`
+        (#206) — archiviert den Eintrag: Er verlässt die Suche, bleibt aber
+        erhalten (kein Hard-Delete). Idempotent: Ein bereits archivierter
+        Eintrag ist ebenfalls `204`. `BrainNotFoundError` nur für einen
+        unbekannten Schlüssel — am Server ununterscheidbar von einem Projekt
+        außerhalb der effektiven Projektmenge (Invariante 1)."""
+        project_id = self._resolve_project_id(project)
+        response = self._send(
+            "DELETE",
+            f"/v1/projects/{project_id}/entries/by-key/{_pfadsegment(external_key)}",
+            idempotent=True,
+        )
+        if response.status_code >= 400:
+            raise _fehler_aus_antwort(response)
+
+    def sync(
+        self,
+        project: str,
+        *,
+        source_revision: str,
+        entries: Iterable[SyncEntry],
+        timeout: float = SYNC_TIMEOUT,
+    ) -> SyncResult:
+        """`PUT /v1/projects/{project_id}/sync` (#206) — bringt den Bestand
+        eines synchronisierten Projekts auf den Stand des Manifests.
+
+        **Eine Transaktion, alles oder nichts:** Jeder Eintrag des Manifests
+        wird angelegt, ersetzt oder als unverändert erkannt; jeder Schlüssel
+        des Projekts, der **nicht** im Manifest steht, wird archiviert. Ein
+        leeres Manifest archiviert den ganzen Bestand. Wird ein Eintrag von
+        der Prüfstrecke abgelehnt (Geheimnis, Sperrliste, Länge), passiert
+        nichts, und die Antwort nennt **alle** Urteile auf einmal
+        (`result.verdict == "rejected"`) — ein normales Ergebnis, keine
+        Exception, wie bei `store()`.
+
+        `source_revision` (etwa ein Commit-Hash) landet im Audit-Log des
+        Servers, mit den Zählern — keine Inhalte. Höchstens 1000 Einträge und
+        8 MiB je Aufruf; mehr sind ein 422/413 vom Server. Nur für Projekte im
+        Modus `synced` (sonst 422), nötig ist mindestens `maintainer`.
+
+        Idempotent (Modul-Docstring): Ein Retry nach einem abgelaufenen Timeout
+        läuft am Server gegen einen bereits geschriebenen Stand und meldet
+        `merged`. `timeout` ersetzt für diesen Aufruf den Client-Vorgabewert
+        (Vorgabe `SYNC_TIMEOUT`, 300 s): Ein Sync mit vielen Einträgen läuft am
+        Server länger als eine Suche.
+        """
+        project_id = self._resolve_project_id(project)
+        body: dict[str, Any] = {
+            "source_revision": source_revision,
+            "entries": [eintrag._to_json() for eintrag in entries],
+        }
+        response = self._send(
+            "PUT",
+            f"/v1/projects/{project_id}/sync",
+            json=body,
+            idempotent=True,
+            timeout=timeout,
+        )
+        if response.status_code == 200:
+            return SyncResult._from_json(response.json())
         if response.status_code == 422:
-            daten = response.json()
-            detail = daten.get("detail")
-            if isinstance(detail, dict) and "verdict" in detail:
-                # Die Ablehnung der Prüfstrecke — ein Ergebnis, kein
-                # Fehler dieses Clients (siehe Docstring oben).
-                return SubmissionResult._from_json(detail)
-            raise exc.BrainValidationError(422, str(detail if detail else daten))
-
+            detail = response.json().get("detail")
+            if isinstance(detail, dict) and detail.get("verdict") == "rejected":
+                return SyncResult._from_rejection(detail)
         raise _fehler_aus_antwort(response)
 
     def feedback(
@@ -347,6 +494,7 @@ class BrainClient:
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         idempotent: bool,
+        timeout: float | None = None,
     ) -> httpx.Response:
         """Transport-Retry — 429 und Verbindungsfehler vor jeder Antwort
         immer, 5xx nur wenn `idempotent`. Gibt jede andere Antwort
@@ -363,11 +511,17 @@ class BrainClient:
         gilt deshalb dieselbe Grenze wie bei einem 5xx: sicher retryable ist
         nur, was beweisbar vor jeder Verarbeitung scheiterte.
         """
+        # Nur setzen, wenn der Aufruf es verlangt — sonst gilt der Vorgabewert
+        # des Clients (`httpx.USE_CLIENT_DEFAULT`, nicht `None`, wäre „kein
+        # Timeout").
+        optionen: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
         versuch = 0
         while True:
             versuch += 1
             try:
-                response = self._client.request(method, path, json=json, params=params)
+                response = self._client.request(
+                    method, path, json=json, params=params, **optionen
+                )
             except (
                 httpx.ConnectError,
                 httpx.ConnectTimeout,
@@ -403,6 +557,15 @@ class BrainClient:
                 self._warten_auf_retry_after(response)
                 continue
 
+            if response.status_code == 409 and "retry-after" in response.headers:
+                # Zeilensperre am Server (#206): nichts geschrieben, für jede
+                # Methode sicher retryable — das `Retry-After` unterscheidet
+                # es von einem fachlichen 409 (Modul-Docstring).
+                if versuch > self._max_retries:
+                    raise exc.BrainLockConflictError(409, _detail(response))
+                self._warten_auf_retry_after(response)
+                continue
+
             ist_5xx = response.status_code >= 500
             if ist_5xx and idempotent and versuch <= self._max_retries:
                 self._warten(versuch)
@@ -428,6 +591,33 @@ class BrainClient:
         except ValueError:
             sekunden = 1.0
         time.sleep(max(0.0, sekunden))
+
+
+def _pfadsegment(external_key: str) -> str:
+    """Der Schlüssel als Pfadsegment — **immer** prozent-kodiert, auch wenn
+    er harmlos aussieht. Ein `#` im Schlüssel schnitte `httpx` sonst als
+    URL-Fragment ab, und der Server sähe stillschweigend einen kürzeren
+    Schlüssel (aus `core.haushalt#name` würde `core.haushalt`) — ein Upsert
+    träfe den falschen Eintrag. Kodiert kommt der volle Schlüssel an und
+    scheitert am Formatprüfer des Servers (422), wo der Fehler hingehört."""
+    return quote(external_key, safe="")
+
+
+def _einreichungsergebnis(response: httpx.Response) -> SubmissionResult:
+    """`store()` und `upsert()` beantworten Erfolg und Ablehnung gleich."""
+    if response.status_code in (200, 201):
+        return SubmissionResult._from_json(response.json())
+
+    if response.status_code == 422:
+        daten = response.json()
+        detail = daten.get("detail")
+        if isinstance(detail, dict) and "verdict" in detail:
+            # Die Ablehnung der Prüfstrecke — ein Ergebnis, kein
+            # Fehler dieses Clients (siehe Docstring von `store()`).
+            return SubmissionResult._from_json(detail)
+        raise exc.BrainValidationError(422, str(detail if detail else daten))
+
+    raise _fehler_aus_antwort(response)
 
 
 def _detail(response: httpx.Response) -> str:

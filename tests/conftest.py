@@ -131,3 +131,60 @@ def make_review_entry_payload(**overrides: object) -> dict[str, object]:
     }
     payload.update(overrides)
     return payload
+
+
+def make_sync_entry_result(**overrides: object) -> dict[str, object]:
+    """Ein Urteil je Schlüssel, wie `SyncEntryResult` (`app/api/synced_entries.py`
+    im Server-Repo, #206) es liefert."""
+    urteil: dict[str, object] = {
+        "external_key": "core.a",
+        "verdict": "stored",
+        "entry_id": str(uuid.uuid4()),
+        "status": "active",
+        "replaced": False,
+        "duplicate_of": None,
+        "findings": [],
+    }
+    urteil.update(overrides)
+    return urteil
+
+
+def make_sync_payload(**overrides: object) -> dict[str, object]:
+    """Die Antwort auf einen erfolgreichen `PUT .../sync`."""
+    payload: dict[str, object] = {
+        "source_revision": "abc123",
+        "results": [make_sync_entry_result()],
+        "archived": [],
+        "counts": {"stored": 1, "replaced": 0, "merged": 0, "archived": 0},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def make_sync_rejection(**overrides: object) -> dict[str, object]:
+    """Der 422-Körper (`detail`), wenn mindestens ein Eintrag abgelehnt wurde —
+    alle Urteile, nichts geschrieben."""
+    befund = {
+        "gate": "secret-scan",
+        "code": "aws-access-token",
+        "severity": "reject",
+        "field": "content",
+        "hint": "sieht aus wie ein Geheimnis",
+        "reference": None,
+    }
+    detail: dict[str, object] = {
+        "verdict": "rejected",
+        "source_revision": "abc123",
+        "results": [
+            make_sync_entry_result(external_key="core.gut"),
+            make_sync_entry_result(
+                external_key="core.geheim",
+                verdict="rejected",
+                entry_id=None,
+                status=None,
+                findings=[befund],
+            ),
+        ],
+    }
+    detail.update(overrides)
+    return detail

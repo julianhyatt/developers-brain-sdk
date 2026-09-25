@@ -7,8 +7,11 @@ in `tests/conftest.py`, nur von der CLI-Seite aus angestoßen.
 
 from __future__ import annotations
 
+import io
 import json
+import uuid
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 import pytest
@@ -22,6 +25,8 @@ from tests.conftest import (
     make_review_entry_payload,
     make_search_payload,
     make_submission_payload,
+    make_sync_payload,
+    make_sync_rejection,
 )
 
 
@@ -318,3 +323,401 @@ def test_kein_token_flag_im_parser() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args(["--token", "irgendwas", "projects"])
+
+
+# --- #206: Suche mit Schwelle, Degradation ---------------------------------------
+
+
+def test_search_reicht_die_schwelle_durch(monkeypatch: pytest.MonkeyPatch) -> None:
+    gesehen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen.update(json.loads(request.content))
+        return json_response(200, make_search_payload())
+
+    _patch_transport(monkeypatch, handler)
+
+    assert cli.main(["search", "x", "--max-cosine-distance", "0.4"]) == 0
+    assert gesehen["max_cosine_distance"] == 0.4
+
+
+def test_search_warnt_auf_stderr_wenn_der_vektorzweig_fehlt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Auf stderr, damit `--json` und Pipes sauber bleiben — aber sichtbar:
+    Eine leere Liste ohne Vektorzweig heißt nicht „gibt es nicht"."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(200, make_search_payload(vector_branch="unavailable"))
+
+    _patch_transport(monkeypatch, handler)
+
+    assert cli.main(["--json", "search", "x"]) == 0
+
+    ausgabe = capsys.readouterr()
+    assert "Vektorzweig nicht verfügbar" in ausgabe.err
+    assert json.loads(ausgabe.out)["vector_branch"] == "unavailable"
+
+
+def test_search_schweigt_wenn_der_vektorzweig_lief(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(200, make_search_payload())
+
+    _patch_transport(monkeypatch, handler)
+
+    cli.main(["search", "x"])
+
+    assert capsys.readouterr().err == ""
+
+
+# --- #206: store --external-key, remove ------------------------------------------
+
+
+def test_store_mit_external_key_ersetzt_per_put(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    projekt = str(uuid.uuid4())
+    gesehen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen["methode"] = request.method
+        gesehen["pfad"] = request.url.path
+        return json_response(200, make_submission_payload(replaced=True))
+
+    _patch_transport(monkeypatch, handler)
+
+    code = cli.main(
+        [
+            "store",
+            "--project",
+            projekt,
+            "--external-key",
+            "core.a~b",
+            "--title",
+            "t",
+            "--content",
+            "c",
+            "--source",
+            "s",
+        ]
+    )
+
+    assert code == 0
+    assert gesehen == {
+        "methode": "PUT",
+        "pfad": f"/v1/projects/{projekt}/entries/by-key/core.a~b",
+    }
+    assert "replaced=true" in capsys.readouterr().out
+
+
+def test_store_ohne_external_key_bleibt_ein_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    methoden: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methoden.append(request.method)
+        return json_response(201, make_submission_payload())
+
+    _patch_transport(monkeypatch, handler)
+
+    cli.main(
+        [
+            "store",
+            "--project",
+            str(uuid.uuid4()),
+            "--title",
+            "t",
+            "--content",
+            "c",
+            "--source",
+            "s",
+        ]
+    )
+
+    assert methoden == ["POST"]
+
+
+def test_remove_archiviert_und_meldet_es(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    methoden: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methoden.append(request.method)
+        return httpx.Response(204)
+
+    _patch_transport(monkeypatch, handler)
+
+    code = cli.main(
+        ["remove", "--project", str(uuid.uuid4()), "--external-key", "core.a"]
+    )
+
+    assert code == 0
+    assert methoden == ["DELETE"]
+    assert "external_key=core.a removed=true" in capsys.readouterr().out
+
+
+def test_remove_unbekannter_schluessel_gibt_exit_code_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(404, {"detail": "Eintrag nicht gefunden"})
+
+    _patch_transport(monkeypatch, handler)
+
+    code = cli.main(
+        ["remove", "--project", str(uuid.uuid4()), "--external-key", "core.weg"]
+    )
+
+    assert code == 1
+    assert "Fehler" in capsys.readouterr().err
+
+
+# --- #206: sync ------------------------------------------------------------------
+
+
+def _manifest(tmp_path: Path, inhalt: object) -> Path:
+    datei = tmp_path / "manifest.json"
+    datei.write_text(json.dumps(inhalt), encoding="utf-8")
+    return datei
+
+
+def _eintrag(**abweichungen: object) -> dict[str, object]:
+    eintrag: dict[str, object] = {
+        "external_key": "core.a",
+        "title": "Titel",
+        "content": "Inhalt",
+        "source": "ci",
+    }
+    eintrag.update(abweichungen)
+    return eintrag
+
+
+def _sync_argumente(datei: Path, *zusatz: str) -> list[str]:
+    return ["sync", "--project", str(uuid.uuid4()), "--manifest", str(datei), *zusatz]
+
+
+def _kein_netz(monkeypatch: pytest.MonkeyPatch) -> list[httpx.Request]:
+    """Ein Handler, der jede Anfrage mitschreibt — für die Tests, die beweisen
+    sollen, dass ein formal kaputtes Manifest **nie** einen Sync anstößt."""
+    gesehen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen.append(request)
+        return json_response(200, make_sync_payload())
+
+    _patch_transport(monkeypatch, handler)
+    return gesehen
+
+
+def test_sync_wendet_das_manifest_an_und_meldet_die_zaehler(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    gesehen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen.update(json.loads(request.content))
+        return json_response(
+            200,
+            make_sync_payload(
+                archived=["core.alt"],
+                counts={"stored": 1, "replaced": 2, "merged": 3, "archived": 1},
+            ),
+        )
+
+    _patch_transport(monkeypatch, handler)
+    datei = _manifest(
+        tmp_path,
+        {
+            "source_revision": "abc123",
+            "entries": [_eintrag(tags=["x"], confidence=0.9)],
+        },
+    )
+
+    code = cli.main(_sync_argumente(datei))
+
+    assert code == 0
+    assert gesehen["source_revision"] == "abc123"
+    assert gesehen["entries"] == [
+        {
+            "external_key": "core.a",
+            "title": "Titel",
+            "content": "Inhalt",
+            "source": "ci",
+            "confidence": 0.9,
+            "tags": ["x"],
+        }
+    ]
+    ausgabe = capsys.readouterr().out
+    assert "verdict=applied" in ausgabe
+    assert "stored=1 replaced=2 merged=3 archived=1" in ausgabe
+    assert "archiviert: core.alt" in ausgabe
+
+
+def test_sync_ablehnung_gibt_exit_code_1_und_nennt_jeden_befund(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(422, {"detail": make_sync_rejection()})
+
+    _patch_transport(monkeypatch, handler)
+    datei = _manifest(tmp_path, {"source_revision": "abc123", "entries": [_eintrag()]})
+
+    code = cli.main(_sync_argumente(datei))
+
+    assert code == 1
+    ausgabe = capsys.readouterr().out
+    assert "verdict=rejected" in ausgabe
+    assert "core.geheim: [reject] secret-scan/aws-access-token" in ausgabe
+
+
+def test_sync_source_revision_flag_ueberschreibt_das_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    gesehen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen.update(json.loads(request.content))
+        return json_response(200, make_sync_payload())
+
+    _patch_transport(monkeypatch, handler)
+    datei = _manifest(tmp_path, {"source_revision": "alt", "entries": []})
+
+    assert cli.main(_sync_argumente(datei, "--source-revision", "neu")) == 0
+    assert gesehen["source_revision"] == "neu"
+
+
+def test_sync_json_gibt_das_ergebnis_maschinenlesbar_aus(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    _patch_transport(
+        monkeypatch, lambda request: json_response(200, make_sync_payload())
+    )
+    datei = _manifest(tmp_path, {"source_revision": "r", "entries": []})
+
+    assert cli.main(["--json", *_sync_argumente(datei)]) == 0
+
+    daten = json.loads(capsys.readouterr().out)
+    assert daten["verdict"] == "applied"
+    assert daten["counts"]["stored"] == 1
+
+
+@pytest.mark.parametrize(
+    ("manifest", "fragment"),
+    [
+        ({"entries": []}, "source_revision fehlt"),
+        ({"source_revision": "r", "entries": "kaputt"}, "'entries' muss eine Liste"),
+        ({"source_revision": "r", "eintraege": []}, "Unbekannte Schlüssel"),
+        (
+            {"source_revision": "r", "entries": [_eintrag(tag=["x"])]},
+            "entries[0]: unbekannte Schlüssel: tag",
+        ),
+        (
+            {"source_revision": "r", "entries": [{"external_key": "core.a"}]},
+            "'title' fehlt",
+        ),
+        (
+            {"source_revision": "r", "entries": [_eintrag(tags="x")]},
+            "'tags' muss eine Liste",
+        ),
+        (
+            {"source_revision": "r", "entries": [_eintrag(confidence="hoch")]},
+            "'confidence' muss eine Zahl",
+        ),
+        ([], "muss ein JSON-Objekt"),
+    ],
+)
+def test_sync_mit_formal_kaputtem_manifest_stoesst_nie_einen_sync_an(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    manifest: object,
+    fragment: str,
+) -> None:
+    """Ein Tippfehler wie `tag` statt `tags` würde bei einem Sync, der
+    Fehlendes archiviert, still Daten verlieren — deshalb strikt, und vor
+    jedem Netzwerkzugriff."""
+    gesehen = _kein_netz(monkeypatch)
+    datei = _manifest(tmp_path, manifest)
+
+    code = cli.main(_sync_argumente(datei))
+
+    assert code == 1
+    assert fragment in capsys.readouterr().err
+    assert gesehen == []
+
+
+def test_sync_mit_ungueltigem_json_gibt_exit_code_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    gesehen = _kein_netz(monkeypatch)
+    datei = tmp_path / "manifest.json"
+    datei.write_text("{nicht json", encoding="utf-8")
+
+    assert cli.main(_sync_argumente(datei)) == 1
+    assert "kein gültiges JSON" in capsys.readouterr().err
+    assert gesehen == []
+
+
+def test_sync_ohne_die_manifestdatei_gibt_exit_code_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    gesehen = _kein_netz(monkeypatch)
+
+    assert cli.main(_sync_argumente(tmp_path / "gibt-es-nicht.json")) == 1
+    assert "nicht lesbar" in capsys.readouterr().err
+    assert gesehen == []
+
+
+def test_sync_liest_das_manifest_von_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gesehen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen.update(json.loads(request.content))
+        return json_response(200, make_sync_payload())
+
+    _patch_transport(monkeypatch, handler)
+    monkeypatch.setattr(
+        "sys.stdin", io.StringIO(json.dumps({"source_revision": "r", "entries": []}))
+    )
+
+    code = cli.main(["sync", "--project", str(uuid.uuid4()), "--manifest", "-"])
+
+    assert code == 0
+    assert gesehen["source_revision"] == "r"
+
+
+def test_sync_manifest_von_stdin_und_token_stdin_schliessen_sich_aus(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gesehen = _kein_netz(monkeypatch)
+
+    code = cli.main(
+        [
+            "--token-stdin",
+            "sync",
+            "--project",
+            str(uuid.uuid4()),
+            "--manifest",
+            "-",
+        ]
+    )
+
+    assert code == 1
+    assert "beide von stdin" in capsys.readouterr().err
+    assert gesehen == []
