@@ -5,6 +5,7 @@ from .exceptions import (
     BrainConnectionError,
     BrainError,
     BrainHTTPError,
+    BrainLockConflictError,
     BrainNotFoundError,
     BrainRateLimitError,
     BrainValidationError,
@@ -17,9 +18,13 @@ from .models import (
     SearchHit,
     SearchResult,
     SubmissionResult,
+    SyncCounts,
+    SyncEntry,
+    SyncEntryResult,
+    SyncResult,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "BrainAmbiguousError",
@@ -28,6 +33,7 @@ __all__ = [
     "BrainConnectionError",
     "BrainError",
     "BrainHTTPError",
+    "BrainLockConflictError",
     "BrainNotFoundError",
     "BrainRateLimitError",
     "BrainValidationError",
@@ -38,5 +44,9 @@ __all__ = [
     "SearchHit",
     "SearchResult",
     "SubmissionResult",
+    "SyncCounts",
+    "SyncEntry",
+    "SyncEntryResult",
+    "SyncResult",
     "__version__",
 ]

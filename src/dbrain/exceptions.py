@@ -63,3 +63,14 @@ class BrainAmbiguousError(BrainHTTPError):
 
 class BrainRateLimitError(BrainHTTPError):
     """429, das auch nach den konfigurierten Retries nicht durchkam."""
+
+
+class BrainLockConflictError(BrainHTTPError):
+    """409 **mit** `Retry-After`, das auch nach den konfigurierten Retries
+    nicht durchkam: Der Server hat die Anfrage wegen einer gleichzeitigen
+    Änderung derselben Zeilen abgebrochen (Zeilensperre, etwa ein laufender
+    Manifest-Sync im selben Projekt) — nichts wurde geschrieben. Ein
+    späterer Versuch ist unverändert zulässig. Nicht zu verwechseln mit
+    einem 409 **ohne** `Retry-After`, das ein fachlicher Konflikt ist
+    (etwa `approve_review()` auf einen Eintrag, der nicht zur Prüfung
+    ansteht) und als `BrainHTTPError` durchkommt."""

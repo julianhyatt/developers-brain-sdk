@@ -36,6 +36,10 @@ class SearchHit:
     score: float
     cosine_distance: float | None
     fulltext_score: float | None
+    external_key: str | None = None
+    """Der Schlüssel, unter dem die Quelle den Eintrag führt — nur bei
+    Einträgen aus einem synchronisierten Projekt, sonst `None` (#206). Damit
+    ordnet ein Leser einen Treffer dem Abschnitt der Quelle zu."""
 
     @classmethod
     def _from_json(cls, data: dict[str, Any]) -> SearchHit:
@@ -55,6 +59,7 @@ class SearchHit:
             score=data["score"],
             cosine_distance=data.get("cosine_distance"),
             fulltext_score=data.get("fulltext_score"),
+            external_key=data.get("external_key"),
         )
 
 
@@ -67,6 +72,18 @@ class SearchResult:
     fusion: str
     vector_candidates: int
     fulltext_candidates: int
+    vector_branch: str = "ok"
+    """`ok`, oder `unavailable`, wenn der Embedding-Anbieter nicht geantwortet
+    hat (#206) — dann stammen die Treffer allein aus dem Volltext: vollständig
+    für wörtliche Begriffe, lückenhaft für Umschreibungen. Eine leere Liste in
+    diesem Zustand heißt nicht „gibt es nicht". `ambiguous`: Der Zweig lief,
+    aber die Kandidatenlage lässt keine Aussage zu. Fehlt das Feld (älterer
+    Server), gilt `ok`."""
+
+    @property
+    def degraded(self) -> bool:
+        """Ob die Antwort ohne Vektorzweig zustande kam."""
+        return self.vector_branch == "unavailable"
 
     @classmethod
     def _from_json(cls, data: dict[str, Any]) -> SearchResult:
@@ -76,6 +93,7 @@ class SearchResult:
             fusion=data["fusion"],
             vector_candidates=data["vector_candidates"],
             fulltext_candidates=data["fulltext_candidates"],
+            vector_branch=data.get("vector_branch", "ok"),
         )
 
 
@@ -117,6 +135,11 @@ class SubmissionResult:
     duplicate_of: uuid.UUID | None
     confidence: float
     findings: tuple[Finding, ...]
+    replaced: bool = False
+    """`True`, wenn `upsert()` einen bestehenden Eintrag ersetzt hat — Kennung
+    stabil, Inhalt neu, Vektor wird neu berechnet (#206). Bei `merged`
+    (unveränderte Wiedereinreichung) `False`."""
+    external_key: str | None = None
 
     @classmethod
     def _from_json(cls, data: dict[str, Any]) -> SubmissionResult:
@@ -131,6 +154,8 @@ class SubmissionResult:
             findings=tuple(
                 Finding._from_json(finding) for finding in data.get("findings", ())
             ),
+            replaced=data.get("replaced", False),
+            external_key=data.get("external_key"),
         )
 
 
@@ -175,6 +200,7 @@ class ReviewEntry:
     created_by: uuid.UUID
     created_at: datetime
     updated_at: datetime
+    external_key: str | None = None
 
     @classmethod
     def _from_json(cls, data: dict[str, Any]) -> ReviewEntry:
@@ -194,6 +220,7 @@ class ReviewEntry:
             created_by=uuid.UUID(data["created_by"]),
             created_at=datetime.fromisoformat(data["created_at"]),
             updated_at=datetime.fromisoformat(data["updated_at"]),
+            external_key=data.get("external_key"),
         )
 
 
@@ -215,4 +242,138 @@ class Project:
             name=data["name"],
             role=data["role"],
             archived=data["archived"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SyncEntry:
+    """Ein Eintrag des Manifests für `BrainClient.sync()` — dieselben Felder
+    wie `store()`, dazu der Schlüssel, unter dem die Quelle ihn führt.
+
+    `external_key`: Kleinbuchstaben, Ziffern und die Trenner `.` `_` `~` `-`,
+    nie am Rand, nie doppelt (Server: `^[a-z0-9]+([._~-][a-z0-9]+)*$`, höchstens
+    200 Zeichen). **Kein `#`** — der Schlüssel steht im URL-Pfad, und `#` ist
+    dort der Fragment-Trenner; wer eine Quelle mit `artikel#abschnitt`
+    hat, bildet den Trenner auf `~` ab. Die Prüfung macht der Server, das SDK
+    dupliziert sie nicht."""
+
+    external_key: str
+    title: str
+    content: str
+    source: str
+    category: str | None = None
+    tags: tuple[str, ...] = ()
+    evidence: tuple[str, ...] = ()
+    confidence: float = 0.5
+
+    def _to_json(self) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "external_key": self.external_key,
+            "title": self.title,
+            "content": self.content,
+            "source": self.source,
+            "confidence": self.confidence,
+        }
+        if self.category is not None:
+            body["category"] = self.category
+        if self.tags:
+            body["tags"] = list(self.tags)
+        if self.evidence:
+            body["evidence"] = list(self.evidence)
+        return body
+
+
+@dataclass(frozen=True, slots=True)
+class SyncEntryResult:
+    """Das Urteil über einen Schlüssel des Manifests — dieselbe Form wie
+    `SubmissionResult`, um den Schlüssel ergänzt."""
+
+    external_key: str
+    verdict: str
+    entry_id: uuid.UUID | None
+    status: str | None
+    replaced: bool
+    duplicate_of: uuid.UUID | None
+    findings: tuple[Finding, ...]
+
+    @classmethod
+    def _from_json(cls, data: dict[str, Any]) -> SyncEntryResult:
+        entry_id = data.get("entry_id")
+        duplicate_of = data.get("duplicate_of")
+        return cls(
+            external_key=data["external_key"],
+            verdict=data["verdict"],
+            entry_id=uuid.UUID(entry_id) if entry_id else None,
+            status=data.get("status"),
+            replaced=data.get("replaced", False),
+            duplicate_of=uuid.UUID(duplicate_of) if duplicate_of else None,
+            findings=tuple(
+                Finding._from_json(finding) for finding in data.get("findings", ())
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SyncCounts:
+    stored: int
+    """Neu angelegt."""
+    replaced: int
+    """Bestehend, Inhalt ersetzt."""
+    merged: int
+    """Bestehend, unverändert — kein Schreibzugriff."""
+    archived: int
+    """Im Projekt vorhanden, nicht im Manifest — archiviert."""
+
+    @classmethod
+    def _from_json(cls, data: dict[str, Any]) -> SyncCounts:
+        return cls(
+            stored=data["stored"],
+            replaced=data["replaced"],
+            merged=data["merged"],
+            archived=data["archived"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SyncResult:
+    """Der Ausgang eines Manifest-Syncs — `verdict` ist `applied` oder
+    `rejected`. Wie bei `store()` ist eine Ablehnung **kein** Fehler dieses
+    Clients: `sync()` gibt sie als normales Ergebnis zurück, unterscheidbar
+    über `verdict`/`ok`. Ein Aufrufer, der nur Exceptions fängt, würde die
+    Begründung sonst nie sehen; eine CI prüft `ok`.
+
+    `rejected`: Mindestens ein Eintrag wurde von der Prüfstrecke abgelehnt
+    (Geheimnis, Sperrliste, Länge) — **nichts wurde geschrieben**, der
+    Bestand steht auf der letzten konsistenten Revision. `results` nennt
+    **alle** Urteile, nicht nur das erste; `archived` ist leer, `counts`
+    `None`."""
+
+    verdict: str
+    source_revision: str
+    results: tuple[SyncEntryResult, ...]
+    archived: tuple[str, ...]
+    counts: SyncCounts | None
+
+    @property
+    def ok(self) -> bool:
+        return self.verdict == "applied"
+
+    @classmethod
+    def _from_json(cls, data: dict[str, Any]) -> SyncResult:
+        return cls(
+            verdict="applied",
+            source_revision=data["source_revision"],
+            results=tuple(SyncEntryResult._from_json(r) for r in data["results"]),
+            archived=tuple(data.get("archived", ())),
+            counts=SyncCounts._from_json(data["counts"]),
+        )
+
+    @classmethod
+    def _from_rejection(cls, data: dict[str, Any]) -> SyncResult:
+        return cls(
+            verdict="rejected",
+            source_revision=data["source_revision"],
+            results=tuple(SyncEntryResult._from_json(r) for r in data["results"]),
+            archived=(),
+            counts=None,
         )

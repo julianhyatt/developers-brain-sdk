@@ -9,17 +9,30 @@ durchgereicht, nicht automatisch wiederholt.
 
 from __future__ import annotations
 
+import json
+import uuid
+
 import httpx
 import pytest
 
+from dbrain.client import (
+    DEFAULT_TIMEOUT,
+    MAX_RETRY_AFTER,
+    SYNC_TIMEOUT,
+    UPSERT_TIMEOUT,
+    BrainClient,
+)
 from dbrain.exceptions import (
     BrainAmbiguousError,
     BrainAuthError,
     BrainConnectionError,
+    BrainHTTPError,
+    BrainLockConflictError,
     BrainNotFoundError,
     BrainRateLimitError,
     BrainValidationError,
 )
+from dbrain.models import SubmissionResult, SyncEntry
 from tests.conftest import (
     TOKEN,
     json_response,
@@ -29,6 +42,8 @@ from tests.conftest import (
     make_review_entry_payload,
     make_search_payload,
     make_submission_payload,
+    make_sync_payload,
+    make_sync_rejection,
 )
 
 
@@ -487,3 +502,512 @@ def test_list_projects_toleriert_unbekannte_felder() -> None:
         projekte = client.list_projects()
 
     assert projekte[0].slug == "a"
+
+
+# --- #206: Suche mit Schwelle, Degradation und Schlüssel -------------------------
+
+
+def test_search_traegt_max_cosine_distance_und_liest_vector_branch() -> None:
+    gesehen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen.update(json.loads(request.content))
+        return json_response(
+            200,
+            make_search_payload(
+                vector_branch="unavailable",
+                hits=[make_hit(external_key="core.haushalt~name")],
+            ),
+        )
+
+    with make_client(handler) as client:
+        ergebnis = client.search("haushalt", max_cosine_distance=0.4)
+
+    assert gesehen["max_cosine_distance"] == 0.4
+    assert ergebnis.vector_branch == "unavailable"
+    assert ergebnis.degraded is True
+    assert ergebnis.hits[0].external_key == "core.haushalt~name"
+
+
+def test_search_ohne_neue_felder_gilt_der_vektorzweig_als_ok() -> None:
+    """Additiv-tolerant: Ein älterer Server kennt `vector_branch` und
+    `external_key` nicht — das ist kein Fehler und keine Degradation."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "max_cosine_distance" not in json.loads(request.content)
+        return json_response(200, make_search_payload(hits=[make_hit()]))
+
+    with make_client(handler) as client:
+        ergebnis = client.search("haushalt")
+
+    assert ergebnis.vector_branch == "ok"
+    assert ergebnis.degraded is False
+    assert ergebnis.hits[0].external_key is None
+
+
+# --- #206: upsert ----------------------------------------------------------------
+
+
+def _upsert(
+    client: BrainClient, projekt: str, schluessel: str = "core.a~b"
+) -> SubmissionResult:
+    return client.upsert(
+        project=projekt,
+        external_key=schluessel,
+        title="Titel",
+        content="Inhalt",
+        source="ci",
+    )
+
+
+def test_upsert_sendet_put_an_den_schluesselpfad_und_liest_das_urteil() -> None:
+    projekt = str(uuid.uuid4())
+    gesehen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen["methode"] = request.method
+        gesehen["pfad"] = request.url.path
+        gesehen["body"] = json.loads(request.content)
+        return json_response(
+            201, make_submission_payload(replaced=False, external_key="core.a~b")
+        )
+
+    with make_client(handler) as client:
+        ergebnis = client.upsert(
+            project=projekt,
+            external_key="core.a~b",
+            title="Titel",
+            content="Inhalt",
+            source="ci",
+            tags=["help"],
+        )
+
+    assert gesehen["methode"] == "PUT"
+    assert gesehen["pfad"] == f"/v1/projects/{projekt}/entries/by-key/core.a~b"
+    assert gesehen["body"] == {
+        "title": "Titel",
+        "content": "Inhalt",
+        "source": "ci",
+        "confidence": 0.5,
+        "tags": ["help"],
+    }
+    assert ergebnis.verdict == "stored"
+    assert ergebnis.replaced is False
+    assert ergebnis.external_key == "core.a~b"
+
+
+def test_upsert_meldet_ersetzt_und_merged() -> None:
+    antworten = iter(
+        [
+            json_response(200, make_submission_payload(replaced=True)),
+            json_response(
+                200,
+                make_submission_payload(
+                    verdict="merged", entry_id=str(uuid.uuid4()), replaced=False
+                ),
+            ),
+        ]
+    )
+
+    with make_client(lambda request: next(antworten)) as client:
+        ersetzt = _upsert(client, str(uuid.uuid4()))
+        unveraendert = _upsert(client, str(uuid.uuid4()))
+
+    assert ersetzt.replaced is True
+    assert unveraendert.verdict == "merged"
+
+
+def test_upsert_rejected_ist_kein_fehler() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(
+            422, {"detail": make_submission_payload(verdict="rejected", entry_id=None)}
+        )
+
+    with make_client(handler) as client:
+        ergebnis = _upsert(client, str(uuid.uuid4()))
+
+    assert ergebnis.verdict == "rejected"
+
+
+def test_upsert_schemafehler_bleibt_eine_exception() -> None:
+    """Ein ungültiger Schlüssel ist ein 422 mit Liste — kein Urteil."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(422, {"detail": [{"loc": ["path", "external_key"]}]})
+
+    with make_client(handler) as client, pytest.raises(BrainValidationError):
+        _upsert(client, str(uuid.uuid4()))
+
+
+def test_upsert_kodiert_eine_raute_statt_den_schluessel_zu_kuerzen() -> None:
+    """Der Fehler, der auf dem Server gefunden wurde: `httpx` schnitte `#`
+    als URL-Fragment ab, und der Server sähe still `core.haushalt` statt
+    `core.haushalt#name` — ein Upsert träfe den falschen Eintrag. Kodiert
+    kommt der volle Schlüssel an und scheitert am Formatprüfer (422)."""
+    gesehen: dict[str, bytes] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen["raw"] = request.url.raw_path
+        return json_response(422, {"detail": [{"msg": "Schlüsselformat"}]})
+
+    with make_client(handler) as client, pytest.raises(BrainValidationError):
+        _upsert(client, str(uuid.uuid4()), schluessel="core.haushalt#name")
+
+    assert gesehen["raw"].endswith(b"/entries/by-key/core.haushalt%23name")
+
+
+def test_upsert_retryt_einen_readtimeout_weil_idempotent() -> None:
+    versuche = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal versuche
+        versuche += 1
+        if versuche == 1:
+            raise httpx.ReadTimeout("zu langsam", request=request)
+        return json_response(200, make_submission_payload(verdict="merged"))
+
+    with make_client(handler) as client:
+        ergebnis = _upsert(client, str(uuid.uuid4()))
+
+    assert versuche == 2
+    assert ergebnis.verdict == "merged"
+
+
+def test_upsert_hat_einen_eigenen_timeout() -> None:
+    gesehen: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen["read"] = request.extensions["timeout"]["read"]
+        return json_response(201, make_submission_payload())
+
+    with make_client(handler) as client:
+        _upsert(client, str(uuid.uuid4()))
+
+    assert gesehen["read"] == UPSERT_TIMEOUT
+
+
+# --- #206: remove ----------------------------------------------------------------
+
+
+def test_remove_archiviert_ueber_den_schluessel() -> None:
+    projekt = str(uuid.uuid4())
+    gesehen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen["methode"] = request.method
+        gesehen["pfad"] = request.url.path
+        return httpx.Response(204)
+
+    with make_client(handler) as client:
+        client.remove(projekt, "core.a~b")  # kein Rückgabewert, kein Fehler
+
+    assert gesehen == {
+        "methode": "DELETE",
+        "pfad": f"/v1/projects/{projekt}/entries/by-key/core.a~b",
+    }
+
+
+def test_remove_unbekannter_schluessel_ist_not_found() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(404, {"detail": "Eintrag nicht gefunden"})
+
+    with make_client(handler) as client, pytest.raises(BrainNotFoundError):
+        client.remove(str(uuid.uuid4()), "core.weg")
+
+
+def test_remove_retryt_5xx_weil_idempotent() -> None:
+    versuche = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal versuche
+        versuche += 1
+        return httpx.Response(503 if versuche == 1 else 204)
+
+    with make_client(handler) as client:
+        client.remove(str(uuid.uuid4()), "core.a")
+
+    assert versuche == 2
+
+
+# --- #206: sync ------------------------------------------------------------------
+
+
+def test_sync_sendet_das_manifest_und_liest_das_ergebnis() -> None:
+    projekt = str(uuid.uuid4())
+    gesehen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen["methode"] = request.method
+        gesehen["pfad"] = request.url.path
+        gesehen["body"] = json.loads(request.content)
+        gesehen["read"] = request.extensions["timeout"]["read"]
+        return json_response(
+            200,
+            make_sync_payload(
+                archived=["core.alt"],
+                counts={"stored": 1, "replaced": 0, "merged": 0, "archived": 1},
+            ),
+        )
+
+    with make_client(handler) as client:
+        ergebnis = client.sync(
+            projekt,
+            source_revision="abc123",
+            entries=[
+                SyncEntry("core.a", "Titel", "Inhalt", "ci"),
+                SyncEntry("core.b", "T", "I", "ci", category="help", tags=("x", "y")),
+            ],
+        )
+
+    assert gesehen["methode"] == "PUT"
+    assert gesehen["pfad"] == f"/v1/projects/{projekt}/sync"
+    assert gesehen["read"] == SYNC_TIMEOUT
+    assert gesehen["body"] == {
+        "source_revision": "abc123",
+        "entries": [
+            {
+                "external_key": "core.a",
+                "title": "Titel",
+                "content": "Inhalt",
+                "source": "ci",
+                "confidence": 0.5,
+            },
+            {
+                "external_key": "core.b",
+                "title": "T",
+                "content": "I",
+                "source": "ci",
+                "confidence": 0.5,
+                "category": "help",
+                "tags": ["x", "y"],
+            },
+        ],
+    }
+    assert ergebnis.ok is True
+    assert ergebnis.verdict == "applied"
+    assert ergebnis.archived == ("core.alt",)
+    assert ergebnis.counts is not None and ergebnis.counts.archived == 1
+    assert ergebnis.results[0].external_key == "core.a"
+
+
+def test_sync_timeout_ist_ueberschreibbar() -> None:
+    gesehen: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen["read"] = request.extensions["timeout"]["read"]
+        return json_response(200, make_sync_payload())
+
+    with make_client(handler) as client:
+        client.sync(str(uuid.uuid4()), source_revision="r", entries=[], timeout=900.0)
+
+    assert gesehen["read"] == 900.0
+
+
+def test_sync_ohne_eintraege_sendet_eine_leere_liste() -> None:
+    """Ein leeres Manifest archiviert den ganzen Bestand — der Server
+    entscheidet, das SDK sendet es unverändert."""
+    gesehen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen.update(json.loads(request.content))
+        return json_response(200, make_sync_payload(results=[], archived=["core.a"]))
+
+    with make_client(handler) as client:
+        ergebnis = client.sync(str(uuid.uuid4()), source_revision="r", entries=[])
+
+    assert gesehen["entries"] == []
+    assert ergebnis.archived == ("core.a",)
+
+
+def test_sync_ablehnung_ist_ein_ergebnis_keine_exception() -> None:
+    """Wie `store()`s `rejected`: Ein Aufrufer, der nur Exceptions fängt,
+    sähe die Begründung sonst nie. Nichts wurde geschrieben, `results`
+    nennt alle Urteile."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(422, {"detail": make_sync_rejection()})
+
+    with make_client(handler) as client:
+        ergebnis = client.sync(
+            str(uuid.uuid4()),
+            source_revision="abc123",
+            entries=[SyncEntry("core.geheim", "T", "I", "ci")],
+        )
+
+    assert ergebnis.ok is False
+    assert ergebnis.verdict == "rejected"
+    assert ergebnis.counts is None and ergebnis.archived == ()
+    assert [r.external_key for r in ergebnis.results] == ["core.gut", "core.geheim"]
+    assert ergebnis.results[1].findings[0].code == "aws-access-token"
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        [{"loc": ["body", "entries"], "msg": "doppelte Schlüssel"}],
+        "Manifest-Sync ist nur für synchronisierte Projekte zulässig",
+    ],
+)
+def test_sync_schemafehler_und_kuratiertes_projekt_sind_exceptions(
+    detail: object,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(422, {"detail": detail})
+
+    with make_client(handler) as client, pytest.raises(BrainValidationError):
+        client.sync(str(uuid.uuid4()), source_revision="r", entries=[])
+
+
+def test_sync_zu_grosses_manifest_ist_ein_http_fehler() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(413, {"detail": "Manifest ist zu groß"})
+
+    with make_client(handler) as client, pytest.raises(BrainHTTPError) as gefangen:
+        client.sync(str(uuid.uuid4()), source_revision="r", entries=[])
+
+    assert gefangen.value.status_code == 413
+
+
+# --- #206: 409 mit Retry-After = Zeilensperre, nichts geschrieben -----------------
+
+
+def test_409_mit_retry_after_wird_wiederholt_auch_bei_schreibenden_aufrufen() -> None:
+    """Der Server antwortet so, wenn die Anfrage an einer Zeilensperre
+    abgebrochen wurde (laufender Sync, Deadlock) — nichts geschrieben, für
+    jede Methode sicher retryable, auch für `store()`."""
+    versuche = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal versuche
+        versuche += 1
+        if versuche == 1:
+            return httpx.Response(
+                409, headers={"Retry-After": "0"}, json={"detail": "kollidiert"}
+            )
+        return json_response(201, make_submission_payload())
+
+    with make_client(handler) as client:
+        ergebnis = client.store(
+            project=str(uuid.uuid4()), title="T", content="I", source="s"
+        )
+
+    assert ergebnis.verdict == "stored"
+    assert versuche == 2
+
+
+def test_409_ohne_retry_after_ist_ein_fachlicher_konflikt_und_wird_nie_wiederholt() -> (
+    None
+):
+    """`approve_review()` auf einen Eintrag, der nicht zur Prüfung ansteht,
+    ist ebenfalls ein 409 — aber ein dauerhafter. Das `Retry-After` ist das
+    Unterscheidungsmerkmal."""
+    versuche = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal versuche
+        versuche += 1
+        return json_response(409, {"detail": "Eintrag steht nicht zur Prüfung"})
+
+    with make_client(handler) as client, pytest.raises(BrainHTTPError) as gefangen:
+        client.approve_review(str(uuid.uuid4()), str(uuid.uuid4()))
+
+    assert versuche == 1
+    assert gefangen.value.status_code == 409
+    assert not isinstance(gefangen.value, BrainLockConflictError)
+
+
+def test_409_mit_retry_after_gibt_nach_max_retries_lock_conflict_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, headers={"Retry-After": "0"}, json={"detail": "x"})
+
+    with (
+        make_client(handler, max_retries=1) as client,
+        pytest.raises(BrainLockConflictError),
+    ):
+        client.remove(str(uuid.uuid4()), "core.a")
+
+
+def test_antworten_ohne_die_neuen_felder_bleiben_lesbar() -> None:
+    """Additiv-tolerant: `replaced` und `external_key` fehlen bei einem
+    älteren Server."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(201, make_submission_payload())
+
+    with make_client(handler) as client:
+        ergebnis = client.store(
+            project=str(uuid.uuid4()), title="T", content="I", source="s"
+        )
+
+    assert ergebnis.replaced is False
+    assert ergebnis.external_key is None
+
+
+# --- Härtung: Retry-After begrenzt, connect-Timeout bleibt, upsert-Timeout -------
+
+
+@pytest.mark.parametrize(
+    ("header", "erwartet"),
+    [
+        ("1e9", MAX_RETRY_AFTER),  # feindlich oder fehlkonfiguriert: gedeckelt
+        ("inf", 1.0),  # nicht endlich → wie ein fehlender Header
+        ("nan", 1.0),
+        ("-5", 0.0),  # keine Wartezeit
+        ("Wed, 21 Oct 2026 07:28:00 GMT", 1.0),  # HTTP-Datum: nicht unterstützt
+        ("3", 3.0),
+    ],
+)
+def test_retry_after_wird_begrenzt_und_unlesbares_faellt_auf_eine_sekunde(
+    monkeypatch: pytest.MonkeyPatch, header: str, erwartet: float
+) -> None:
+    geschlafen: list[float] = []
+    monkeypatch.setattr("dbrain.client.time.sleep", geschlafen.append)
+    versuche = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal versuche
+        versuche += 1
+        if versuche == 1:
+            return httpx.Response(429, headers={"Retry-After": header})
+        return json_response(200, make_search_payload())
+
+    with make_client(handler) as client:
+        client.search("x")
+
+    assert geschlafen == [erwartet]
+
+
+def test_ein_aufruf_timeout_laesst_den_connect_timeout_des_clients_stehen() -> None:
+    """Ein float gälte für alle Phasen: Ein 300-s-Sync ließe einen nicht
+    erreichbaren Server 300 s auf die Verbindung warten."""
+    gesehen: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen.update(request.extensions["timeout"])
+        return json_response(200, make_sync_payload())
+
+    with make_client(handler) as client:
+        client.sync(str(uuid.uuid4()), source_revision="r", entries=[])
+
+    assert gesehen["read"] == SYNC_TIMEOUT
+    assert gesehen["connect"] == DEFAULT_TIMEOUT
+
+
+def test_upsert_timeout_ist_ueberschreibbar() -> None:
+    gesehen: dict[str, float] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen["read"] = request.extensions["timeout"]["read"]
+        return json_response(201, make_submission_payload())
+
+    with make_client(handler) as client:
+        client.upsert(
+            project=str(uuid.uuid4()),
+            external_key="core.a",
+            title="Titel",
+            content="Inhalt",
+            source="ci",
+            timeout=120.0,
+        )
+
+    assert gesehen["read"] == 120.0
